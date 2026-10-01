@@ -1,3 +1,7 @@
+import { activityTarget } from "../../features/agents/activity-target";
+import { PanelView } from "../../features/panels/PanelView";
+import { contributionKey } from "../../features/conversation/ContributionBoundary";
+import type { Panels, RegisteredPanel } from "../../features/panels/service";
 import {
   usePanelTabHost,
   usePanelTabTitle,
@@ -44,6 +48,7 @@ import { Tabs } from "../../shared/design-system/ui/Tabs";
 import { ProfileActivity } from "./ProfileActivity";
 import type { PanelProps } from "../../features/panels/service";
 import {
+  profileActivityViewKey,
   profileAgentHint,
   profilePanelKey,
   profileTarget,
@@ -68,8 +73,11 @@ const emptyState: AgentControlState = {
 };
 const emptyControlSnapshot = () => emptyState;
 const noSubscribe = () => () => {};
+const emptyPanels: readonly RegisteredPanel[] = [];
+const noPanels = () => emptyPanels;
 
 export function ProfilePanel({
+  panels,
   relay,
   target,
   context,
@@ -80,6 +88,7 @@ export function ProfilePanel({
   close,
   refreshControl = true,
 }: PanelProps & {
+  panels?: Panels;
   relay: RelayData;
   navigation?: Navigation;
   control?: AgentControl;
@@ -90,17 +99,20 @@ export function ProfilePanel({
   refreshControl?: boolean;
 }) {
   const connection = useRelayConnection(relay);
-  const pubkey = profilePanelKey(target);
+  const activityKey = profileActivityViewKey(target);
+  const pubkey = profilePanelKey(target) ?? activityKey;
   if (!pubkey) return <p>Unsupported profile.</p>;
   if (connection.status !== "ready")
     return <p>Connect to a community to view this profile.</p>;
   return (
     <ProfileDetails
-      key={`${connection.scope}:${connection.generation}:${pubkey}:${instanceId ?? ""}`}
+      key={`${connection.scope}:${connection.generation}:${pubkey}:${instanceId ?? ""}:${activityKey ? "activity" : "info"}`}
+      initialTab={activityKey ? "activity" : "info"}
+      panels={panels}
       refreshControl={refreshControl}
       session={connection.session}
       pubkey={pubkey}
-      agentHint={profileAgentHint(target)}
+      agentHint={profileAgentHint(target) || !!activityKey}
       instanceId={instanceId}
       context={context}
       navigation={navigation}
@@ -122,6 +134,8 @@ export function ProfilePanel({
   );
 }
 function ProfileDetails({
+  panels,
+  initialTab,
   children,
   agentHint,
   refreshControl,
@@ -137,6 +151,8 @@ function ProfileDetails({
   close,
 }: {
   agents2: Agents2 | undefined;
+  panels: Panels | undefined;
+  initialTab: "info" | "activity";
   agentHint: boolean;
   instanceId?: string | undefined;
   refreshControl: boolean;
@@ -176,18 +192,35 @@ function ProfileDetails({
     emptyControlSnapshot,
   );
   const [tab, setTab] = useState<
-    "info" | "runtime" | "channels" | "memories" | `agent:${string}`
-  >("info");
-  // An Agents2 agent's sections come from its type and the app, not the harness.
+    | "info"
+    | "runtime"
+    | "channels"
+    | "memories"
+    | "activity"
+    | `agent:${string}`
+  >(initialTab);
   const plugin = useAgent2(agents2, pubkey);
   const channelChoices = useChannelChoices(
     plugin ? session.channels : undefined,
+  );
+  const available = useSyncExternalStore(
+    panels?.subscribe ?? noSubscribe,
+    panels?.snapshot ?? noPanels,
+    noPanels,
   );
   const sections =
     plugin && agents2
       ? agentSections({ agents2, ...plugin, channels: channelChoices })
       : [];
   const section = sections.find((item) => item.value === tab);
+  const activity = activityTarget(pubkey, context?.channelId);
+  const resolvedActivity = panels?.resolve(activity);
+  const activityPanel =
+    resolvedActivity &&
+    available.includes(resolvedActivity) &&
+    context?.canOpen(activity)
+      ? resolvedActivity
+      : undefined;
   const tabHost = usePanelTabHost();
   const tabbed = !!tabHost;
   const region = useRef<HTMLElement>(null);
@@ -257,11 +290,16 @@ function ProfileDetails({
     if (logTarget && !logAuthorized) setLogTarget(null);
   }, [logTarget, logAuthorized]);
   const selectedTab =
+    (tab === "activity" && !activityPanel) ||
     (tab === "memories" && (!isOwner || plugin)) ||
     (tab === "runtime" && !canViewRuntime) ||
     (tab.startsWith("agent:") && !section)
       ? "info"
       : tab;
+  useEffect(() => {
+    if (!activityPanel)
+      setTab((current) => (current === "activity" ? "info" : current));
+  }, [activityPanel]);
   useEffect(() => {
     if (!isOwner)
       setTab((current) => (current === "memories" ? "info" : current));
@@ -427,6 +465,9 @@ function ProfileDetails({
               ? [{ value: "runtime" as const, label: "Runtime" }]
               : []),
             { value: "channels", label: "Channels" },
+            ...(displayAgent && activityPanel
+              ? [{ value: "activity" as const, label: "Activity" }]
+              : []),
             ...(isOwner && !plugin
               ? [{ value: "memories" as const, label: "Memories" }]
               : []),
@@ -435,7 +476,15 @@ function ProfileDetails({
           variant="panel"
           renderPanel={(selected) => (
             <div className={styles.tabContent}>
-              {selected.startsWith("agent:") ? (
+              {selected === "activity" && activityPanel ? (
+                <PanelView
+                  key={contributionKey(activityPanel)}
+                  panel={activityPanel}
+                  target={activity}
+                  context={context}
+                  close={close}
+                />
+              ) : selected.startsWith("agent:") ? (
                 sections.find((item) => item.value === selected)?.render()
               ) : selected === "info" ? (
                 <>
@@ -493,6 +542,9 @@ function ProfileDetails({
                   )}
                   {knownAgent && (
                     <ProfileActivity
+                      onViewActivity={
+                        activityPanel ? () => setTab("activity") : undefined
+                      }
                       session={session}
                       pubkey={pubkey}
                       context={context}
