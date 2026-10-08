@@ -1,8 +1,12 @@
 import { SnapshotAttachment } from "./SnapshotAttachment";
 import { snapshotAttachmentKind } from "../agents/snapshot-preview";
-import { Avatar } from "../../shared/design-system/ui/Avatar";
 import { LightningIcon } from "../../shared/design-system/icons";
 import { WorkflowByline } from "./WorkflowByline";
+import { threadWorkingAgents } from "../agents/thread-working";
+import { TypingDots } from "../../shared/design-system/ui/TypingDots";
+import { selectProfiles } from "../relay/profile-selection";
+import { ComposerAccessories } from "../conversation/ComposerAccessories";
+import { visibleReactions } from "./visible-reactions";
 import { useConversationPresentation } from "../conversation/ConversationPresentation";
 import { MessageLink } from "../conversation/MessageLink";
 import { DayDivider, MessageTimestamp } from "./MessageTimestamp";
@@ -10,17 +14,17 @@ import { activityTarget } from "../agents/activity-target";
 import { useChannelIdentityNames } from "../identity-names/react";
 import { Button } from "../../shared/design-system/ui/Button";
 import { ReplySummary } from "./ReplySummary";
-import { AgentAvatar } from "../agents/AgentAvatar";
+import { Avatar } from "../../shared/design-system/ui/Avatar";
 import { usePresenceStatus } from "../presence/react";
 import { IconButton } from "../../shared/design-system/ui/IconButton";
 import {
   memo,
   useId,
+  useMemo,
   useRef,
   useState,
   useEffect,
   useCallback,
-  useMemo,
   useSyncExternalStore,
   type FocusEvent,
   type ReactNode,
@@ -147,6 +151,13 @@ function revealFocusedThumbnail(event: FocusEvent<HTMLDivElement>) {
   else if (rect.left < start) strip.scrollLeft -= start - rect.left;
 }
 
+const noReactionSubscription = () => () => {};
+const noReactionProfiles = new Map<
+  string,
+  import("../relay/contracts").Profile
+>();
+const emptyReactionProfiles = () => noReactionProfiles;
+
 export const MessageRow = memo(function MessageRow({
   row,
   getThreadRoot,
@@ -178,6 +189,38 @@ export const MessageRow = memo(function MessageRow({
 }: MessageRowProps) {
   const resolveName = useChannelIdentityNames(session, row.channelId);
   const directory = useReferenceDirectory(session, participantProfiles);
+  const reactorIds = row.reactions
+    .filter(
+      (reaction) => !reaction.emoji && ["👀", "💬"].includes(reaction.content),
+    )
+    .flatMap((reaction) => reaction.events.map((event) => event.authorId))
+    .sort()
+    .join(":");
+  const reactorSelection = useMemo(
+    () =>
+      session && reactorIds
+        ? selectProfiles(session.profiles, reactorIds.split(":"))
+        : undefined,
+    [session, reactorIds],
+  );
+  const reactorProfiles = useSyncExternalStore(
+    reactorSelection?.subscribe ?? noReactionSubscription,
+    reactorSelection?.snapshot ?? emptyReactionProfiles,
+    emptyReactionProfiles,
+  );
+  const reactions = useMemo(
+    () =>
+      visibleReactions(
+        row.reactions,
+        new Set([
+          ...(agentPubkeys ?? []),
+          ...[...reactorProfiles, ...directory.profiles]
+            .filter(([, value]) => value.isAgent)
+            .map(([key]) => key),
+        ]),
+      ),
+    [row.reactions, agentPubkeys, directory.profiles, reactorProfiles],
+  );
   const threadUnread = useThreadUnread(
     row.replyCount > 0 && onOpenThread ? unread : undefined,
     row.channelId,
@@ -284,7 +327,6 @@ export const MessageRow = memo(function MessageRow({
     row.authorId,
   );
   const presenceId = useId();
-  const thinkingId = useId();
   const timeReply = row.diff ? undefined : parseMediaTimeReply(row.content);
   const displayRow = timeReply ? { ...row, content: timeReply.content } : row;
   const emojiOnly = usesLargeEmojiPresentation(displayRow.content, row.emoji);
@@ -441,27 +483,16 @@ export const MessageRow = memo(function MessageRow({
             size={layout === "timeline" ? "default" : "sm"}
             shape="round"
             aria-label={`View ${name} profile`}
-            aria-describedby={
-              [
-                presence !== "unknown" && presenceId,
-                avatarShape === "squircle" && thinkingId,
-              ]
-                .filter(Boolean)
-                .join(" ") || undefined
-            }
+            aria-describedby={presence !== "unknown" ? presenceId : undefined}
             onClick={(event) => {
               event.currentTarget.focus();
               onOpenLink(target);
             }}
             icon={
               <>
-                <AgentAvatar
-                  session={session}
-                  agentPubkey={row.authorId}
-                  channelId={row.channelId}
+                <Avatar
                   src={picture}
                   alt=""
-                  thinkingDescriptionId={thinkingId}
                   fallback={name}
                   size={compactAvatar ? "small" : "fill"}
                   shape={avatarShape}
@@ -477,10 +508,7 @@ export const MessageRow = memo(function MessageRow({
           />
         ) : (
           <span className={compactAvatar ? styles.nestedAvatar : "contents"}>
-            <AgentAvatar
-              session={session}
-              agentPubkey={row.authorId}
-              channelId={row.channelId}
+            <Avatar
               src={picture}
               alt={
                 presence === "unknown"
@@ -828,10 +856,23 @@ export const MessageRow = memo(function MessageRow({
               items
             );
           })}
+          {active && session && scope && extensions?.accessories && (
+            <ComposerAccessories
+              registry={extensions.accessories}
+              session={session}
+              scope={scope}
+              channelId={row.channelId}
+              threadRootId={row.threadRootId}
+              message={row}
+              canOpen={canOpenLink ?? (() => false)}
+              open={onOpenLink}
+            />
+          )}
           {session && scope && extensions ? (
             <MessageReactions
               onFocusedRemoval={() => menuTrigger.current?.focus()}
               row={row}
+              displayedReactions={reactions}
               session={session}
               scope={scope}
               tools={extensions.tools}
@@ -843,9 +884,9 @@ export const MessageRow = memo(function MessageRow({
               }
             />
           ) : (
-            row.reactions.length > 0 && (
+            reactions.length > 0 && (
               <div className={`${styles.reactions} ${styles.reactionFallback}`}>
-                {row.reactions.map((reaction) => (
+                {reactions.map((reaction) => (
                   <span
                     key={JSON.stringify([
                       reaction.content,
@@ -914,9 +955,25 @@ export const MessageRow = memo(function MessageRow({
                     data-thread-working=""
                     aria-hidden="true"
                   >
-                    <i />
-                    <i />
-                    <i />
+                    {threadAgents.slice(0, 2).map((agent) => {
+                      const name = resolveName(agent.pubkey, agent.name);
+                      return (
+                        <Avatar
+                          key={agent.pubkey}
+                          src={
+                            agent.avatar ? media(agent.avatar, "small") : null
+                          }
+                          alt=""
+                          fallback={name}
+                          size="compact"
+                          shape="squircle"
+                        />
+                      );
+                    })}
+                    {threadAgents.length > 2 && (
+                      <span>+{threadAgents.length - 2}</span>
+                    )}
+                    <TypingDots />
                   </span>
                 )}
                 {threadAgents.length > 0 && row.replyCount === 0 && (
@@ -952,7 +1009,7 @@ const noSubscribe = () => () => {};
 const none: readonly never[] = [];
 const noActions = () => none;
 const noLibrary = () => undefined;
-// App-managed agents publish typing, not observer telemetry, while they work.
+// Confirmed lifecycle evidence wins; legacy agents retain public typing fallback.
 // A joined-key snapshot keeps unrelated typing from re-rendering the row. Like
 // the sidebar, only the viewer's own agents count: the library is read while
 // someone types here, so an agent no loaded row names yet is still recognized.
@@ -975,13 +1032,24 @@ function useThreadAgents(
     get,
     get,
   );
-  const getLibrary = (keys && session?.agentChoices.snapshot) || noLibrary;
+  const activity = useSyncExternalStore(
+    session?.agentActivity?.subscribe ?? noSubscribe,
+    session?.agentActivity?.snapshot ?? noLibrary,
+    session?.agentActivity?.snapshot ?? noLibrary,
+  );
+  const typers = threadWorkingAgents(
+    activity,
+    keys ? keys.split(",") : [],
+    channelId,
+    rootId,
+  );
+  const hasWork = typers.length > 0;
+  const getLibrary = (hasWork && session?.agentChoices.snapshot) || noLibrary;
   const library = useSyncExternalStore(
-    (keys && session?.agentChoices.subscribe) || noSubscribe,
+    (hasWork && session?.agentChoices.subscribe) || noSubscribe,
     getLibrary,
     getLibrary,
   );
-  const typers = keys.split(",");
   return (
     library?.identities.filter(({ pubkey }) => typers.includes(pubkey)) ?? []
   );
