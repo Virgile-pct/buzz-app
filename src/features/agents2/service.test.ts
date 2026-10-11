@@ -78,6 +78,13 @@ function fakeRelay(origin = "https://relay.example.test") {
       live.add(listener);
       return () => live.delete(listener);
     },
+    publishAgentPresence: vi.fn(
+      async (
+        _: "online" | "offline",
+        __: readonly string[],
+        ___: AbortSignal,
+      ) => {},
+    ),
   } as unknown as RelaySession;
   let snapshot: RelaySnapshot = {
     status: "ready",
@@ -125,6 +132,9 @@ function fakeRelay(origin = "https://relay.example.test") {
       for (const listener of live) listener(batch);
     },
     archives,
+    presence: session.publishAgentPresence as ReturnType<
+      typeof vi.fn<RelaySession["publishAgentPresence"]>
+    >,
     origin,
   };
 }
@@ -320,6 +330,7 @@ async function setup({
     reconnecting: fake.reconnecting,
     recover: fake.recover,
     archives: fake.archives,
+    presence: fake.presence,
     second,
     select: client.select,
     leave: client.leave,
@@ -1373,4 +1384,64 @@ it("keeps an Interest while a watch still uses it", async () => {
     attention: { "watch/channel": null, "interest/default": null },
   });
   expect(service.find(bot)?.attention).toEqual({});
+});
+
+/** What each presence call said, as `status:agents`. */
+const said = (presence: { mock: { calls: unknown[][] } }) =>
+  presence.mock.calls.map(
+    ([status, agents]) => `${status}:${(agents as string[]).join(",")}`,
+  );
+
+it("says the agents it runs are online, again every minute and on a new session, and offline once removed", async () => {
+  vi.useFakeTimers();
+  const { service, presence, connect } = await setup();
+  await service.create({ type: "example/echo", name: "Echo" });
+  await vi.advanceTimersByTimeAsync(5_000);
+  expect(said(presence)).toEqual([`online:${bot}`]);
+  await vi.advanceTimersByTimeAsync(50_000);
+  expect(said(presence)).toEqual([`online:${bot}`]);
+  await vi.advanceTimersByTimeAsync(10_000);
+  expect(said(presence)).toEqual([`online:${bot}`, `online:${bot}`]);
+  connect(true);
+  await vi.advanceTimersByTimeAsync(0);
+  expect(said(presence)).toHaveLength(3);
+  await service.remove(bot);
+  await vi.advanceTimersByTimeAsync(0);
+  expect(said(presence).at(-1)).toBe(`offline:${bot}`);
+  await vi.advanceTimersByTimeAsync(120_000);
+  expect(said(presence)).toHaveLength(4);
+});
+
+it("leaves an agent another copy of the app holds to that copy, and does not say it went offline", async () => {
+  vi.useFakeTimers();
+  const { service, presence, native } = await setup();
+  native.claim.mockResolvedValue(false);
+  await service.create({ type: "example/echo", name: "Echo" });
+  await vi.advanceTimersByTimeAsync(10_000);
+  expect(said(presence)).toEqual([]);
+  native.claim.mockResolvedValue(true);
+  await vi.advanceTimersByTimeAsync(10_000);
+  expect(said(presence)).toEqual([`online:${bot}`]);
+  native.claim.mockResolvedValue(false);
+  await vi.advanceTimersByTimeAsync(120_000);
+  expect(said(presence)).toEqual([`online:${bot}`]);
+});
+
+it("tries a refused presence again after half a minute, not every tick", async () => {
+  vi.useFakeTimers();
+  const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+  const { service, presence } = await setup();
+  presence.mockRejectedValueOnce(new Error("rate-limited"));
+  await service.create({ type: "example/echo", name: "Echo" });
+  await vi.advanceTimersByTimeAsync(5_000);
+  expect(presence).toHaveBeenCalledTimes(1);
+  await vi.advanceTimersByTimeAsync(20_000);
+  expect(presence).toHaveBeenCalledTimes(1);
+  await vi.advanceTimersByTimeAsync(10_000);
+  expect(presence).toHaveBeenCalledTimes(2);
+  expect(warn).toHaveBeenCalledWith(
+    "Agent presence was not sent",
+    expect.any(Error),
+  );
+  warn.mockRestore();
 });
