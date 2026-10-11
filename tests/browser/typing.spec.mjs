@@ -251,3 +251,39 @@ for (const scope of ["channel", "thread"]) {
     expect(app.report.publications).toEqual([]);
   });
 }
+
+test("a growing thread composer keeps a bottom reader at the latest reply", async ({
+  page,
+  app,
+}) => {
+  await open(page, app);
+  const root = app.histories
+    .get("primary/alpha")
+    .find((e) => e.content === "Thread root 0");
+  for (let i = 0; i < 30; i++) app.reply(root.id);
+  await page
+    .locator(`[data-channel-timeline] [data-message-id="${root.id}"]`)
+    .getByRole("button", { name: /^View thread:/ })
+    .click();
+  const history = page.getByRole("region", {
+    name: "Thread messages",
+    exact: true,
+  });
+  await expect(history.locator("[data-message-id]")).toHaveCount(33);
+  await edge(page, 1, history);
+  const gap = () =>
+    history.evaluate((el) => el.scrollHeight - el.clientHeight - el.scrollTop);
+  const viewport = () => history.evaluate((el) => el.clientHeight);
+  const idle = await viewport();
+  // Wrapped text and new lines grow the composer, shrinking the thread above it.
+  await page
+    .getByRole("textbox", { name: "Reply to thread", exact: true })
+    .click();
+  await page.keyboard.type("Lorem ipsum dolor sit amet. ".repeat(8));
+  for (const line of ["Second line", "Third line"]) {
+    await page.keyboard.press("Shift+Enter");
+    await page.keyboard.type(line);
+  }
+  await expect.poll(viewport).toBeLessThan(idle - 40);
+  await expect.poll(gap).toBeLessThan(2);
+});
