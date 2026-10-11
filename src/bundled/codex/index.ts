@@ -58,6 +58,8 @@ export const apply: PluginModule["apply"] = (ctx) => {
       { id: "codex", title: "Codex", component: CodexTab },
       { id: "settings", title: "Settings", component: SettingsTab },
     ],
+    accepts: (trigger, agent) =>
+      trigger.type === "timer" || trigger.event.pubkey === agent.owner,
     run: (delivery) => runtime.run(delivery),
     timeoutMs: 2 * 60_000,
   });

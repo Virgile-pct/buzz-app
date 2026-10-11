@@ -81,6 +81,7 @@ export const test = base.extend({
   developmentReact: [false, { option: true, scope: "worker" }],
   pluginFixtures: [false, { option: true, scope: "worker" }],
   agentManagement: [false, { option: true, scope: "worker" }],
+  localAgentActivity: [false, { option: true, scope: "worker" }],
   pairingFixture: [false, { option: true, scope: "worker" }],
   companionFixture: [false, { option: true, scope: "worker" }],
   compiledApp: [buildApp, { scope: "worker" }],

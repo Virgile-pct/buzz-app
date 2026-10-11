@@ -1,3 +1,8 @@
+import {
+  TypingPresentation,
+  useReplacedTypers,
+} from "../conversation/typing-presentation";
+import { breathing, localActivity } from "../agents2/activity";
 import { SnapshotAttachment } from "./SnapshotAttachment";
 import { snapshotAttachmentKind } from "../agents/snapshot-preview";
 import { LightningIcon } from "../../shared/design-system/icons";
@@ -158,7 +163,22 @@ const noReactionProfiles = new Map<
 >();
 const emptyReactionProfiles = () => noReactionProfiles;
 
-export const MessageRow = memo(function MessageRow({
+export const MessageRow = memo(function MessageRow(props: MessageRowProps) {
+  // A mounted message bubble can replace this row's thread-summary activity,
+  // without suppressing work in another row or another conversation surface.
+  return props.session && props.scope && props.extensions?.accessories ? (
+    <TypingPresentation
+      active
+      key={`${props.scope}:${props.row.channelId}:${props.row.id}`}
+    >
+      <MessageRowContent {...props} />
+    </TypingPresentation>
+  ) : (
+    <MessageRowContent {...props} />
+  );
+});
+
+function MessageRowContent({
   row,
   getThreadRoot,
   session,
@@ -226,12 +246,14 @@ export const MessageRow = memo(function MessageRow({
     row.channelId,
     row.threadRootId ?? row.id,
   );
-  const threadAgents = useThreadAgents(
+  const { agents: threadAgents, waiting: threadWaiting } = useThreadAgents(
     onOpenThread && (row.replyCount > 0 || !row.threadRootId)
       ? session
       : undefined,
     row.channelId,
     row.threadRootId ?? row.id,
+    row.id,
+    row.threadRootId,
   );
   const channels = session?.channels;
   const listed = useListedChannel(
@@ -265,13 +287,13 @@ export const MessageRow = memo(function MessageRow({
   const workingLabel = threadAgents.length
     ? `${threadAgents
         .map(({ pubkey, name }) => resolveName(pubkey, name))
-        .join(", ")} working`
+        .join(", ")} ${threadWaiting ? "waiting" : "working"}`
     : undefined;
   const firstThreadAgent = threadAgents[0];
   const threadWorkingLabel =
     threadAgents.length === 1 && firstThreadAgent
-      ? `${resolveName(firstThreadAgent.pubkey, firstThreadAgent.name)} is working`
-      : `${threadAgents.length} agents are working`;
+      ? `${resolveName(firstThreadAgent.pubkey, firstThreadAgent.name)} is ${threadWaiting ? "waiting" : "working"}`
+      : `${threadAgents.length} agents are ${threadWaiting ? "waiting" : "working"}`;
   const name = resolveName(
     row.authorId,
     profile?.name ?? row.authorId.slice(0, 10),
@@ -951,7 +973,7 @@ export const MessageRow = memo(function MessageRow({
                 )}
                 {threadAgents.length > 0 && (
                   <span
-                    className={styles.threadWorking}
+                    className={`${styles.threadWorking} buzz-arrive`}
                     data-thread-working=""
                     aria-hidden="true"
                   >
@@ -973,7 +995,7 @@ export const MessageRow = memo(function MessageRow({
                     {threadAgents.length > 2 && (
                       <span>+{threadAgents.length - 2}</span>
                     )}
-                    <TypingDots />
+                    <TypingDots state={threadWaiting ? "waiting" : "working"} />
                   </span>
                 )}
                 {threadAgents.length > 0 && row.replyCount === 0 && (
@@ -985,7 +1007,7 @@ export const MessageRow = memo(function MessageRow({
       </div>
     </div>
   );
-});
+}
 // Subscribe only for mounted thread buttons. Evidence and reading remain session-owned;
 // rendering a row must not initiate per-thread reads or acknowledge unseen replies.
 function useThreadUnread(
@@ -1017,7 +1039,14 @@ function useThreadAgents(
   session: RelaySession | undefined,
   channelId: string,
   rootId: string,
+  messageId: string,
+  messageThreadRootId: string | undefined,
 ) {
+  const represented = useReplacedTypers(
+    session,
+    channelId,
+    messageThreadRootId,
+  );
   const get = () =>
     session?.typing
       .snapshot()
@@ -1042,6 +1071,7 @@ function useThreadAgents(
     keys ? keys.split(",") : [],
     channelId,
     rootId,
+    { messageId, agents: represented },
   );
   const hasWork = typers.length > 0;
   const getLibrary = (hasWork && session?.agentChoices.snapshot) || noLibrary;
@@ -1050,7 +1080,19 @@ function useThreadAgents(
     getLibrary,
     getLibrary,
   );
-  return (
-    library?.identities.filter(({ pubkey }) => typers.includes(pubkey)) ?? []
+  const local = localActivity(
+    {
+      local: (activity?.local ?? []).filter(
+        (row) => row.messageId !== messageId || !represented.has(row.agent),
+      ),
+    },
+    channelId,
+    rootId,
   );
+  return {
+    agents:
+      library?.identities.filter(({ pubkey }) => typers.includes(pubkey)) ?? [],
+    waiting:
+      typers.length > 0 && typers.every((agent) => breathing(local.get(agent))),
+  };
 }

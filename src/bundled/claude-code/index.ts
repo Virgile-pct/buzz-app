@@ -50,6 +50,10 @@ export const apply: PluginModule["apply"] = (ctx) => {
       { id: "claude", title: "Claude", component: ClaudeTab },
       { id: "settings", title: "Settings", component: SettingsTab },
     ],
+    accepts: (trigger, agent) =>
+      trigger.type === "timer" ||
+      config(agent.config).respondTo === "anyone" ||
+      trigger.event.pubkey === agent.owner,
     run: (delivery) => runtime.run(delivery),
     timeoutMs: HANDOVER_MS,
   });

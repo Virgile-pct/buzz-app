@@ -1,4 +1,5 @@
 import { afterEach, expect, it, vi } from "vitest";
+import type { WorkOutcome } from "../../features/agents2/activity";
 import type { Agent, Delivery } from "../../features/agents2/service";
 import type { Host } from "../../features/host/service";
 import type { EventData, RelayEvent } from "../../features/relay/events";
@@ -77,6 +78,7 @@ function setup(thread: readonly EventData[] = []) {
     upload: vi.fn(),
     remember: vi.fn(),
   };
+  const work: PromiseLike<WorkOutcome>[] = [];
   const deliver = (trigger: Delivery["trigger"]) =>
     runtime.run({
       trigger,
@@ -84,10 +86,23 @@ function setup(thread: readonly EventData[] = []) {
       agent,
       config: DEFAULT_CONFIG,
       signal: new AbortController().signal,
+      workingUntil: (done: PromiseLike<WorkOutcome>) => {
+        work.push(done);
+      },
     } as Delivery);
   const claudes = () =>
     fake.processes.filter((process) => process.id === "claude");
-  return { runtime, deliver, published, claudes, fake, read, data, agent };
+  return {
+    runtime,
+    deliver,
+    published,
+    claudes,
+    fake,
+    read,
+    data,
+    agent,
+    work,
+  };
 }
 
 it("hands a mention to its thread's session", async () => {
@@ -348,4 +363,31 @@ it("warms a spare for each agent of its type and stops those that go away", asyn
   runtime.sync([]);
   await flush(10);
   expect(claudes().every((process) => process.killed)).toBe(true);
+});
+
+it("reports the actual Claude result after handover, including a resolved failure", async () => {
+  const f = setup();
+  f.runtime.sync([{ pubkey: self, config: DEFAULT_CONFIG } as Agent]);
+  await flush(10);
+  const spare = f.claudes()[0];
+  if (!spare) throw new Error("No spare");
+  spare.hold = true;
+  await f.deliver({
+    type: "mention",
+    event: message("1", "@Claude check", {
+      tags: [
+        ["h", channel],
+        ["p", self],
+      ],
+    }),
+  });
+  expect(f.work).toHaveLength(1);
+  const result = vi.fn();
+  void Promise.resolve(f.work[0]).then(result);
+  await flush(10);
+  expect(result).not.toHaveBeenCalled();
+  spare.exit(1, "Error: Invalid API key\n");
+  await flush(10);
+  expect(result).toHaveBeenCalledWith(expect.objectContaining({ ok: false }));
+  f.runtime.dispose();
 });

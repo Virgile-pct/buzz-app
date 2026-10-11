@@ -23,6 +23,7 @@ import {
 } from "../features/notifications/messages";
 import { AccountActionsService } from "../features/account-actions/service";
 import { ShortcutsService } from "../features/shortcuts/service";
+import { createLocalAgentActivity } from "../features/agents2/activity";
 import { Agents2Service } from "../features/agents2/service";
 import { createShortcutBindings } from "../features/shortcuts/preferences";
 import { ConversationService } from "../features/conversation/service";
@@ -61,6 +62,7 @@ export function createServices() {
   const settingsCards = new SettingsCardsService(ctx);
   const channelTemplates = new TemplateProvidersService(ctx);
   const identityNames = new IdentityNamesService(ctx, agentControl);
+  const localAgents = createLocalAgentActivity();
   const identity = nativeIdentityEnabled() ? createIdentity() : undefined;
   const communities = createCommunities(
     ctx,
@@ -70,13 +72,20 @@ export function createServices() {
     agentControl,
     identity?.ready,
     identity ? connectNativeTransport : undefined,
+    localAgents.reader,
   );
   ctx.provide("communityReader", {
     snapshot: communities.snapshot,
     subscribe: communities.subscribe,
   });
   const relay = communities.relay;
-  const agents2 = new Agents2Service(ctx, relay);
+  const agents2 = new Agents2Service(
+    ctx,
+    relay,
+    undefined,
+    undefined,
+    localAgents,
+  );
   ctx.effect(() => bindAgentMentions(agentControl, communities));
   ctx.effect(() => bindTeamTextSync(agentControl, communities));
   const notifications = new NotificationsService(

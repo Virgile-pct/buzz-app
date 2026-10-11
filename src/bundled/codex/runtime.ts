@@ -1,3 +1,4 @@
+import type { WorkOutcome } from "../../features/agents2/activity";
 import type {
   Agent,
   AgentHandle,
@@ -37,6 +38,9 @@ type Request = {
   /** Latest request's thread, independent of session scope; absent in DMs. */
   toolRoot?: string;
   interest: string;
+  finishActivity(result: WorkOutcome): void;
+  /** Latest live step of the turn handling this request; display only. */
+  step?(tool: string, target?: string): void;
 };
 type Saved = { threadId: string; workspace: string };
 type Active = {
@@ -50,6 +54,7 @@ type Active = {
   signal: AbortSignal;
   version: number;
   sentVersion?: number;
+  requests: Request[];
 };
 type Lane = {
   tail: Promise<void>;
@@ -209,7 +214,14 @@ export class CodexRuntime {
     const toolRoot =
       channel?.channelType === "dm" ? undefined : rootOf(trigger.event);
     const root = settings.scope === "channel" ? undefined : toolRoot;
+    let finishActivity!: (result: WorkOutcome) => void;
+    const done = new Promise<WorkOutcome>((resolve) => {
+      finishActivity = resolve;
+    });
+    delivery.workingUntil?.(done);
     const request: Request = {
+      finishActivity,
+      ...(delivery.step ? { step: delivery.step } : {}),
       event: trigger.event,
       agent,
       settings,
@@ -223,6 +235,10 @@ export class CodexRuntime {
         trigger.type === "watch" ? (trigger.interest?.instructions ?? "") : "",
     };
     if (!validWorkspace(settings.workspace)) {
+      request.finishActivity({
+        ok: false,
+        error: "Choose a workspace in Codex settings first.",
+      });
       await this.publish(
         request,
         "Choose an absolute workspace path or ~/.buzz in Codex settings first.",
@@ -243,13 +259,19 @@ export class CodexRuntime {
       const accepted = active.steering.then(async () => {
         try {
           await active.ready;
-          if (entry.abort.signal.aborted) return;
+          if (entry.abort.signal.aborted) {
+            request.finishActivity({ ok: false, error: "Codex was stopped" });
+            return;
+          }
           if (active.finished) {
             this.start(request, text, key, lane, entry);
             return;
           }
           const context = await this.history(request, entry.abort.signal);
-          if (entry.abort.signal.aborted) return;
+          if (entry.abort.signal.aborted) {
+            request.finishActivity({ ok: false, error: "Codex was stopped" });
+            return;
+          }
           if (active.finished) {
             this.start(request, text, key, lane, entry);
             return;
@@ -261,15 +283,25 @@ export class CodexRuntime {
               `${context}${turnInput(request.event, request.conversation, text, request.interest, true)}`,
             ),
           });
+          // execute waits for this steering chain before settling the turn, so
+          // even an acknowledgement racing turn/completed belongs to this result.
+          active.requests.push(request);
           active.reply = request;
           active.version++;
         } catch (error) {
-          if (entry.abort.signal.aborted) return;
+          if (entry.abort.signal.aborted) {
+            request.finishActivity({ ok: false, error: "Codex was stopped" });
+            return;
+          }
           // A completion racing the request means this is the next ordinary turn.
           if (message(error) === "no active turn to steer") {
             this.start(request, text, key, lane, entry);
             return;
           }
+          request.finishActivity({
+            ok: false,
+            error: `Steering was not accepted: ${message(error)}`,
+          });
           await this.publish(
             request,
             `Steering was not accepted: ${message(error)}. Send another mention to continue.`,
@@ -294,14 +326,20 @@ export class CodexRuntime {
     const job = lane.tail
       .catch(() => undefined)
       .then(async () => {
-        if (entry.abort.signal.aborted) return;
+        if (entry.abort.signal.aborted) {
+          request.finishActivity({ ok: false, error: "Codex was stopped" });
+          return;
+        }
         await this.execute(request, text, key, current, entry);
       });
     lane.tail = job;
     this.status(request.agent.pubkey, key, "Starting");
     // Agents2 can deliver follow-ups and other conversations immediately.
     void job
-      .catch((error) => console.error("Codex turn failed", error))
+      .catch((error) => {
+        request.finishActivity({ ok: false, error: message(error) });
+        console.error("Codex turn failed", error);
+      })
       .finally(() => {
         if (current.tail === job && !current.active) entry.lanes.delete(key);
       });
@@ -464,6 +502,7 @@ export class CodexRuntime {
       workspace: request.settings.workspace,
       signal,
       version: 0,
+      requests: [request],
     };
     void active.ready.catch(() => undefined);
     lane.active = active;
@@ -498,6 +537,13 @@ export class CodexRuntime {
       }
       if (!p || p.threadId !== active.threadId) return;
       if (wire.method === "turn/started" && p.turn) active.turnId = p.turn.id;
+      const step =
+        wire.method === "item/started"
+          ? codexStep(p.item as Record<string, unknown> | undefined)
+          : undefined;
+      if (step)
+        for (const request of active.requests)
+          request.step?.(step.tool, step.target);
       if (wire.method === "item/started" && p.item?.command)
         this.status(agent.pubkey, key, "Working", p.item.command);
       if (
@@ -517,6 +563,10 @@ export class CodexRuntime {
         else finish(p.turn.status);
       }
     });
+    let outcome: WorkOutcome = {
+      ok: false,
+      error: "Codex was stopped before finishing",
+    };
     try {
       const rpc = await entry.opening;
       signal.throwIfAborted();
@@ -645,6 +695,11 @@ export class CodexRuntime {
       await active.steering;
       signal.throwIfAborted();
       if (status === "interrupted") {
+        outcome = {
+          ok: false,
+          error:
+            "Codex’s turn was interrupted. Send another mention to continue.",
+        };
         await this.terminals(rpc, active.threadId);
         await this.publish(
           active.reply,
@@ -652,6 +707,14 @@ export class CodexRuntime {
         );
         this.status(agent.pubkey, key, "Interrupted");
       } else {
+        outcome =
+          active.sentVersion === active.version
+            ? { ok: true }
+            : {
+                ok: false,
+                error:
+                  "Codex finished without a final reply. Send another mention to continue.",
+              };
         if (active.sentVersion !== active.version)
           await this.publish(
             active.reply,
@@ -660,6 +723,7 @@ export class CodexRuntime {
         this.status(agent.pubkey, key, "Idle");
       }
     } catch (error) {
+      outcome = { ok: false, error: message(error) };
       active.finished = true;
       notReady(error);
       await active.steering;
@@ -687,6 +751,7 @@ export class CodexRuntime {
         this.status(agent.pubkey, key, "Needs attention", reason);
       }
     } finally {
+      for (const request of active.requests) request.finishActivity(outcome);
       signal.removeEventListener("abort", abort);
       turnAbort.abort(new Error("The Codex turn has ended"));
       off();
@@ -709,3 +774,101 @@ const DYNAMIC_TOOLS = [
   },
 ];
 const EMPTY: readonly SessionView[] = Object.freeze([]);
+
+/** A started Codex item as a step, named in the shared step vocabulary.
+ * Shapes follow codex app-server v2 `ThreadItem` / `CommandAction` (camelCase). */
+export function codexStep(
+  item: Record<string, unknown> | undefined,
+): { tool: string; target?: string } | undefined {
+  const text = (value: unknown) =>
+    typeof value === "string" && value ? value : undefined;
+  const step = (tool: string, target?: unknown) => {
+    const on = text(target);
+    return on ? { tool, target: on } : { tool };
+  };
+  const file = (value: unknown) => text(value)?.split("/").at(-1);
+  switch (item?.type) {
+    case "commandExecution": {
+      const actions = Array.isArray(item.commandActions)
+        ? (item.commandActions as Record<string, unknown>[])
+        : [];
+      const action = actions[0];
+      if (action?.type === "read")
+        return step("Read", text(action.name) ?? file(action.path));
+      if (action?.type === "search") return step("Grep", action.query);
+      if (action?.type === "listFiles") return step("ListFiles", action.path);
+      return step(
+        "Shell",
+        programs(text(action?.command) ?? text(item.command)),
+      );
+    }
+    case "fileChange": {
+      const first = Array.isArray(item.changes)
+        ? (item.changes[0] as { path?: unknown } | undefined)
+        : undefined;
+      return step("Edit", file(first?.path));
+    }
+    case "mcpToolCall":
+    case "dynamicToolCall":
+      return text(item.tool) ? step(String(item.tool)) : undefined;
+    case "collabAgentToolCall":
+      return step("Agent", item.prompt);
+    case "webSearch":
+      return step("WebSearch", item.query);
+    case "imageView":
+      return step("ImageView", file(item.path));
+    case "plan":
+      return step("TodoWrite");
+    case "contextCompaction":
+      return step("Compacting");
+    case "reasoning":
+      return step("Thinking");
+    case "agentMessage":
+      return step("Writing reply");
+    default:
+      return undefined;
+  }
+}
+
+/** The programs a shell command runs ("mktemp, xargs"), without the login-shell
+ * wrapper, arguments or quoted scripts. Raw commands stay in the transcript. */
+export function programs(command: string | undefined): string | undefined {
+  if (!command) return undefined;
+  const inner =
+    /^(?:\S*\/)?(?:ba|z)?sh\s+-l?c\s+(["'])([\s\S]*)\1\s*$/.exec(
+      command.trim(),
+    )?.[2] ?? command;
+  const segments: string[] = [];
+  let current = "";
+  let quote: string | undefined;
+  for (const char of inner) {
+    if (quote) {
+      if (char === quote) quote = undefined;
+      current += char;
+    } else if (char === "'" || char === '"') {
+      quote = char;
+      current += char;
+    } else if (char === "|" || char === ";" || char === "&" || char === "\n") {
+      segments.push(current);
+      current = "";
+    } else current += char;
+  }
+  segments.push(current);
+  const names = new Set<string>();
+  for (const segment of segments) {
+    const word = segment
+      .trim()
+      .split(/\s+/)
+      .find((token) => token && !/^[A-Za-z_][A-Za-z0-9_]*=/.test(token));
+    const name = word
+      ?.replace(/^["']|["']$/g, "")
+      .split("/")
+      .at(-1);
+    if (name && /^[\w.+-]+$/.test(name)) names.add(name);
+  }
+  const list = [...names];
+  if (!list.length) return undefined;
+  return list.length > 3
+    ? `${list.slice(0, 3).join(", ")} and ${list.length - 3} more`
+    : list.join(", ");
+}

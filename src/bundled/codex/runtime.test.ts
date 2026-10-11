@@ -1,11 +1,12 @@
 import * as React from "react";
 import { apply } from "./index";
-import { afterEach, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import type { WorkOutcome } from "../../features/agents2/activity";
 import type { Agent, Delivery } from "../../features/agents2/service";
 import type { RelayData } from "../../features/relay/service";
 import type { EventData } from "../../features/relay/events";
 import type { HostProcessOptions } from "../../features/host/service";
-import { CodexRuntime } from "./runtime";
+import { CodexRuntime, codexStep, programs } from "./runtime";
 import type { Wire } from "./rpc";
 
 // The plugin registers only in the Mac/Linux desktop app.
@@ -228,6 +229,7 @@ function fixture(
   };
   runtime.sync([{ pubkey } as Agent], scope);
   let id = 0;
+  const work: PromiseLike<WorkOutcome>[] = [];
   const delivery = (content: string, threadRoot = root): Delivery => {
     const result: Delivery = {
       trigger: {
@@ -253,6 +255,9 @@ function fixture(
         instructions: "TEST_INSTRUCTIONS",
       },
       signal: new AbortController().signal,
+      workingUntil: (done) => {
+        work.push(done);
+      },
     };
     if (result.trigger.type !== "timer")
       events.push(result.trigger.event as EventData);
@@ -362,6 +367,7 @@ function fixture(
     });
   };
   return {
+    work,
     runtime,
     tool,
     query,
@@ -1250,3 +1256,79 @@ it.each([false, true])(
     });
   },
 );
+
+it("keeps Codex activity live past handover and reports the adapter's actual error", async () => {
+  const f = fixture();
+  await f.runtime.run(f.delivery("check"));
+  await vi.waitFor(() => expect(f.starts()).toHaveLength(1));
+  expect(f.work).toHaveLength(1);
+  const result = vi.fn();
+  void Promise.resolve(f.work[0]).then(result);
+  expect(result).not.toHaveBeenCalled();
+  const params = f.starts()[0]?.params as { threadId: string };
+  f.emit({
+    method: "turn/completed",
+    params: {
+      threadId: params.threadId,
+      turn: {
+        id: "turn-1",
+        status: "failed",
+        error: { message: "Provider unavailable" },
+      },
+    },
+  });
+  await vi.waitFor(() =>
+    expect(result).toHaveBeenCalledWith({
+      ok: false,
+      error: "Provider unavailable",
+    }),
+  );
+});
+
+describe("codexStep", () => {
+  it("maps started items into the shared step vocabulary", () => {
+    expect(codexStep({ type: "commandExecution", command: "ls" })).toEqual({
+      tool: "Shell",
+      target: "ls",
+    });
+    expect(
+      codexStep({
+        type: "commandExecution",
+        command: "sed -n 1,40p src/a.ts",
+        commandActions: [{ type: "read", name: "a.ts", path: "src/a.ts" }],
+      }),
+    ).toEqual({ tool: "Read", target: "a.ts" });
+    expect(
+      codexStep({
+        type: "commandExecution",
+        command: "rg agent",
+        commandActions: [{ type: "search", query: "agent", path: null }],
+      }),
+    ).toEqual({ tool: "Grep", target: "agent" });
+    expect(
+      codexStep({ type: "fileChange", changes: [{ path: "/x/notes.md" }] }),
+    ).toEqual({ tool: "Edit", target: "notes.md" });
+    expect(codexStep({ type: "mcpToolCall", tool: "send_message" })).toEqual({
+      tool: "send_message",
+    });
+    expect(codexStep({ type: "reasoning" })).toEqual({ tool: "Thinking" });
+    expect(codexStep({ type: "userMessage" })).toBeUndefined();
+    expect(codexStep(undefined)).toBeUndefined();
+  });
+});
+
+describe("programs", () => {
+  it("names the programs a command runs, without the shell wrapper or scripts", () => {
+    expect(
+      programs(
+        `/bin/zsh -lc "mktemp /tmp/activity-test.XXXX | xargs -I'{}' sh -c 'printf hello > \\"$1\\"; printf x' sh '{}'"`,
+      ),
+    ).toBe("mktemp, xargs");
+    expect(programs("which copilot || true")).toBe("which, true");
+    expect(programs("FOO=1 /usr/bin/git status && pnpm test")).toBe(
+      "git, pnpm",
+    );
+    expect(programs("a; b; c; d; e")).toBe("a, b, c and 2 more");
+    expect(programs("")).toBeUndefined();
+  });
+});

@@ -212,7 +212,16 @@ function ProfileDetails({
     plugin && agents2
       ? agentSections({ agents2, ...plugin, channels: channelChoices })
       : [];
-  const section = sections.find((item) => item.value === tab);
+  // Opened for activity, a plugin agent shows its type's own first tab (its
+  // sessions) until the reader picks a tab; harness agents keep Activity.
+  const [activityRequested, setActivityRequested] = useState(
+    initialTab === "activity",
+  );
+  const requestedTab =
+    activityRequested && tab === "activity" && sections[0]
+      ? sections[0].value
+      : tab;
+  const section = sections.find((item) => item.value === requestedTab);
   const activity = activityTarget(pubkey, context?.channelId);
   const resolvedActivity = panels?.resolve(activity);
   const activityPanel =
@@ -290,12 +299,12 @@ function ProfileDetails({
     if (logTarget && !logAuthorized) setLogTarget(null);
   }, [logTarget, logAuthorized]);
   const selectedTab =
-    (tab === "activity" && !activityPanel) ||
-    (tab === "memories" && (!isOwner || plugin)) ||
-    (tab === "runtime" && !canViewRuntime) ||
-    (tab.startsWith("agent:") && !section)
+    (requestedTab === "activity" && !activityPanel) ||
+    (requestedTab === "memories" && (!isOwner || plugin)) ||
+    (requestedTab === "runtime" && !canViewRuntime) ||
+    (requestedTab.startsWith("agent:") && !section)
       ? "info"
-      : tab;
+      : requestedTab;
   useEffect(() => {
     if (!activityPanel)
       setTab((current) => (current === "activity" ? "info" : current));
@@ -457,7 +466,10 @@ function ProfileDetails({
         </div>
         <Tabs
           value={selectedTab}
-          onValueChange={setTab}
+          onValueChange={(value) => {
+            setActivityRequested(false);
+            setTab(value);
+          }}
           items={[
             { value: "info", label: "Info" },
             ...sections.map(({ value, label }) => ({ value, label })),

@@ -1,3 +1,4 @@
+import type { LocalAgentSource } from "../agents2/activity";
 import type { AgentControl, AgentView } from "./control";
 import type { AgentLibrarySnapshot, createAgentLibrary } from "./library";
 import type { ChannelList } from "../relay/contracts";
@@ -58,12 +59,14 @@ export function createAgentChoices({
   scope,
   library,
   native,
+  plugins,
   archives,
   signal,
 }: {
   scope: string;
   library: ReturnType<typeof createAgentLibrary>["queries"];
   native?: Pick<AgentControl, "snapshot" | "subscribe" | "refresh"> | undefined;
+  plugins?: LocalAgentSource | undefined;
   /** Absent only on hosts without archive evidence; nothing is then hidden. */
   archives?:
     | Pick<
@@ -98,16 +101,19 @@ export function createAgentChoices({
         legacy: AgentLibrarySnapshot;
         local: ReturnType<AgentControl["snapshot"]> | undefined;
         archive: IdentityArchiveSnapshot;
+        plugins: ReturnType<LocalAgentSource["snapshot"]> | undefined;
         value: AgentChoicesSnapshot;
       }
     | undefined;
   const snapshot = (): AgentChoicesSnapshot => {
     if (signal.aborted) return empty;
+    const plugin = plugins?.snapshot();
     const legacy = library.snapshot(),
       local = native?.snapshot(),
       archive = archives?.snapshot() ?? noArchives;
     if (
       cached?.legacy === legacy &&
+      cached.plugins === plugin &&
       cached.local === local &&
       cached.archive === archive
     )
@@ -133,6 +139,9 @@ export function createAgentChoices({
     const errors = [
       legacy.error,
       local?.status === "error" ? local.error : undefined,
+      plugin?.status === "error"
+        ? "Could not read local plugin agents"
+        : undefined,
     ].filter(Boolean);
     const templateSource =
       !local || local.status === "unavailable" ? legacy : local;
@@ -146,26 +155,50 @@ export function createAgentChoices({
         templateSource.status === "idle" || templateSource.status === "loading",
       ...(templateSource.error ? { error: templateSource.error } : {}),
     };
+    // Plugin identities join the general inventory; templates retain their
+    // existing source/admission contract until that surface adopts them.
+    if (plugin?.status === "ready")
+      for (const row of plugin.identities) {
+        if (
+          row.deleted ||
+          row.owner !== viewer ||
+          relayPartition(relayOrigin(row.relay), row.owner) !== scope
+        )
+          continue;
+        if (!choices.has(row.pubkey))
+          choices.set(row.pubkey, {
+            pubkey: row.pubkey,
+            name: row.name,
+            managed: false,
+          });
+      }
     const value: AgentChoicesSnapshot = {
       templates,
-      status: ready
-        ? "ready"
-        : errors.length
-          ? "error"
-          : legacy.status === "loading" || local?.status === "loading"
-            ? "loading"
-            : legacy.status === "idle" || local?.status === "idle"
-              ? "idle"
-              : "unavailable",
+      status:
+        ready || plugin?.status === "ready"
+          ? "ready"
+          : errors.length
+            ? "error"
+            : legacy.status === "loading" || local?.status === "loading"
+              ? "loading"
+              : legacy.status === "idle" || local?.status === "idle"
+                ? "idle"
+                : "unavailable",
       pending:
         legacy.status === "idle" ||
         legacy.status === "loading" ||
         local?.status === "idle" ||
-        local?.status === "loading",
+        local?.status === "loading" ||
+        plugin?.status === "loading",
       complete:
         legacy.status === "ready" &&
         !legacy.error &&
-        (!local || local.status === "ready" || local.status === "unavailable"),
+        (!local ||
+          local.status === "ready" ||
+          local.status === "unavailable") &&
+        (!plugin ||
+          plugin.status === "ready" ||
+          plugin.status === "unavailable"),
       definitions: legacy.status === "ready" ? legacy.definitions : [],
       identities: [...choices.values()],
       selectable: [...choices.values()].filter(
@@ -174,7 +207,7 @@ export function createAgentChoices({
       archives: archive,
       ...(errors.length ? { error: errors.join(" ") } : {}),
     };
-    cached = { legacy, local, archive, value };
+    cached = { legacy, local, archive, plugins: plugin, value };
     return value;
   };
   const usesLegacy = (source: SelectionSource) =>
@@ -187,11 +220,13 @@ export function createAgentChoices({
       if (signal.aborted) return () => {};
       const stopLibrary = library.subscribe(listener),
         stopNative = native?.subscribe(listener),
-        stopArchives = archives?.subscribe(listener);
+        stopArchives = archives?.subscribe(listener),
+        stopPlugins = plugins?.subscribe(listener);
       const stop = () => {
         stopLibrary();
         stopNative?.();
         stopArchives?.();
+        stopPlugins?.();
         signal.removeEventListener("abort", retired);
       };
       const retired = () => {

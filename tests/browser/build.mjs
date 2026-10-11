@@ -16,6 +16,7 @@ export async function buildApp(
     pluginFixtures,
     companionFixture,
     agentManagement,
+    localAgentActivity,
     pairingFixture,
   },
   use,
@@ -99,6 +100,28 @@ export function createNativeAgentControl() {
   return createAgentControl(nativeAgentControlHost());
 }
 `;
+        },
+      });
+    if (localAgentActivity)
+      config.plugins.push({
+        name: "fixture-local-agent",
+        transform(code, id) {
+          const fixture = JSON.stringify(
+            join(root, "tests/browser/local-agents-fixture.ts"),
+          );
+          if (id === join(root, "src/features/agents2/native.ts")) {
+            const start = code.indexOf("export const nativeAgents =");
+            if (start < 0) throw new Error("Missing native Agents2 seam");
+            return (
+              code.slice(0, start) +
+              `import { localAgentsNative } from ${fixture};\nexport const nativeAgents = localAgentsNative;`
+            );
+          }
+          if (id === join(root, "src/bundled/index.ts"))
+            return (
+              `import { localAgentPlugin } from ${fixture};\n` +
+              code.replace("= [", "= [localAgentPlugin,")
+            );
         },
       });
     const start = performance.now();

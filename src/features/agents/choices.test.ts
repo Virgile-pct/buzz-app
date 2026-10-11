@@ -1,4 +1,5 @@
-import { expect, it } from "vitest";
+import { createLocalAgentActivity } from "../agents2/activity";
+import { expect, it, vi } from "vitest";
 import { createAgentControl } from "./control";
 import { controlFixture } from "./control-testing";
 import { createAgentLibrary } from "./library";
@@ -369,5 +370,51 @@ it("hides known-archived agents from selection but keeps them as known agents", 
   } finally {
     lifetime.abort();
     library.dispose();
+  }
+});
+
+it("includes plugin agents from the existing host inventory in their owner/community without changing template policy", () => {
+  const source = createLocalAgentActivity();
+  const lifetime = new AbortController();
+  const library = createAgentLibrary(undefined);
+  const choices = createAgentChoices({
+    scope,
+    library: library.queries,
+    plugins: source.reader,
+    signal: lifetime.signal,
+  });
+  const notify = vi.fn();
+  const off = choices.subscribe(notify);
+  try {
+    const agent = {
+      pubkey: "e".repeat(64),
+      name: "Plugin agent",
+      owner: viewer,
+      relay: "wss://relay.example.test",
+      type: "plugin/agent",
+      deleted: false,
+    };
+    source.identities({
+      status: "ready",
+      identities: [
+        agent,
+        { ...agent, pubkey: "f".repeat(64), owner: "b".repeat(64) },
+        { ...agent, pubkey: "c".repeat(64), relay: "wss://other.example" },
+      ],
+    });
+    expect(choices.snapshot().identities.map((row) => row.pubkey)).toEqual([
+      agent.pubkey,
+    ]);
+    expect(choices.snapshot().selectable[0]?.name).toBe("Plugin agent");
+    expect(choices.snapshot().templates.identities).toEqual([]);
+    expect(notify).toHaveBeenCalledOnce();
+    source.identities({
+      status: "ready",
+      identities: [{ ...agent, deleted: true }],
+    });
+    expect(choices.snapshot().identities).toEqual([]);
+  } finally {
+    off();
+    lifetime.abort();
   }
 });

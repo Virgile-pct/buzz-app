@@ -1,3 +1,4 @@
+import { createLocalAgentActivity, type WorkOutcome } from "./activity";
 import { Context } from "@deepseek-ai/cordis";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import type { RelayEvent } from "../relay/events";
@@ -164,6 +165,8 @@ type Config = { reply: string };
 async function setup({
   storage = memoryStorage(),
   identities = [] as AgentIdentity[],
+  accepts = undefined as AgentType<Config>["accepts"],
+  timeoutMs = 60_000,
 } = {}) {
   const ctx = new Context();
   ctx.provide("pluginStatus", {
@@ -172,7 +175,14 @@ async function setup({
   });
   const fake = fakeRelay();
   const native = fakeNative(identities);
-  const service = new Agents2Service(ctx, fake.relay, native, storage);
+  const activity = createLocalAgentActivity();
+  const service = new Agents2Service(
+    ctx,
+    fake.relay,
+    native,
+    storage,
+    activity,
+  );
   const plugin = ctx.extend({
     pluginOwner: Object.freeze({ id: "example", revision: "one" }),
   });
@@ -180,6 +190,7 @@ async function setup({
   const type: AgentType<Config> = {
     id: "echo",
     title: "Echo",
+    timeoutMs,
     defaults: () => ({
       config: { reply: "ok" },
       attention: {
@@ -196,11 +207,14 @@ async function setup({
       },
     }),
     run,
+    ...(accepts ? { accepts } : {}),
   };
   plugin.agents2.register(type);
   await vi.waitFor(() => expect(service.snapshot().status).toBe("ready"));
   return {
     service,
+    activity,
+    type,
     native,
     storage,
     run,
@@ -982,4 +996,213 @@ it("keeps an Interest while a watch still uses it", async () => {
     attention: { "watch/channel": null, "interest/default": null },
   });
   expect(service.find(bot)?.attention).toEqual({});
+});
+
+it("projects accepted queued work and keeps working past handover until the plugin's actual result", async () => {
+  const f = await setup();
+  await f.service.create({ type: "example/echo", name: "Echo" });
+  let releaseHandover!: () => void;
+  let finish!: (outcome: WorkOutcome) => void;
+  const done = new Promise<WorkOutcome>((resolve) => {
+    finish = resolve;
+  });
+  f.run.mockImplementationOnce((delivery) => {
+    delivery.workingUntil?.(done);
+    return new Promise<void>((resolve) => {
+      releaseHandover = resolve;
+    });
+  });
+  const first = event("1", {
+    tags: [
+      ["h", channel],
+      ["p", bot],
+    ],
+  });
+  const second = event("2", {
+    tags: [
+      ["h", channel],
+      ["p", bot],
+    ],
+  });
+  f.emit({ events: [first, second], channelId: channel });
+  try {
+    await vi.waitFor(() =>
+      expect(f.activity.reader.work().map((row) => row.state)).toEqual([
+        "working",
+        "waiting",
+      ]),
+    );
+    expect(f.activity.reader.work()[0]).toMatchObject({
+      agent: bot,
+      messageId: first.id,
+      threadRootId: first.id,
+      channelId: channel,
+    });
+    releaseHandover();
+    await vi.waitFor(() => expect(f.run).toHaveBeenCalledTimes(2));
+    await vi.waitFor(() =>
+      expect(f.activity.reader.work().map((row) => row.state)).toEqual([
+        "working",
+        "done",
+      ]),
+    );
+    finish({ ok: false, error: "Provider unavailable" });
+    await vi.waitFor(() =>
+      expect(f.activity.reader.work()[0]).toMatchObject({
+        state: "error",
+        error: "Provider unavailable",
+      }),
+    );
+  } finally {
+    releaseHandover?.();
+    finish({ ok: true });
+    await f.ctx.fiber.dispose();
+  }
+});
+
+it("does not show receipt for another app's agent or a plugin-rejected author, and retires late work", async () => {
+  const f = await setup({
+    accepts: (trigger) =>
+      trigger.type === "timer" || trigger.event.pubkey === viewer,
+  });
+  await f.service.create({ type: "example/echo", name: "Echo" });
+  try {
+    f.native.claim.mockResolvedValue(false);
+    f.emit({
+      events: [
+        event("1", {
+          tags: [
+            ["h", channel],
+            ["p", bot],
+          ],
+        }),
+      ],
+    });
+    await settle();
+    expect(f.activity.reader.work()).toEqual([]);
+    expect(f.run).not.toHaveBeenCalled();
+    f.native.claim.mockResolvedValue(true);
+    f.type.accepts = (trigger) =>
+      trigger.type === "timer" || trigger.event.pubkey === viewer;
+    f.emit({
+      events: [
+        event("2", {
+          tags: [
+            ["h", channel],
+            ["p", bot],
+          ],
+        }),
+      ],
+    });
+    await settle();
+    expect(f.activity.reader.work()).toEqual([]);
+    let finish!: (result: WorkOutcome) => void;
+    const done = new Promise<WorkOutcome>((resolve) => {
+      finish = resolve;
+    });
+    f.run.mockImplementationOnce((delivery) => delivery.workingUntil?.(done));
+    f.emit({
+      events: [
+        event("3", {
+          pubkey: viewer,
+          tags: [
+            ["h", channel],
+            ["p", bot],
+          ],
+        }),
+      ],
+    });
+    await vi.waitFor(() =>
+      expect(f.activity.reader.work()[0]?.state).toBe("working"),
+    );
+    await f.service.remove(bot);
+    finish({ ok: false, error: "Late old result" });
+    await settle();
+    expect(f.activity.reader.work()).toEqual([]);
+  } finally {
+    await f.ctx.fiber.dispose();
+  }
+});
+
+it("keeps a handed-off request and its original scope through reconnect, without reviving it from old callbacks", async () => {
+  const f = await setup();
+  await f.service.create({ type: "example/echo", name: "Echo" });
+  let finish!: (result: WorkOutcome) => void;
+  const done = new Promise<WorkOutcome>((resolve) => {
+    finish = resolve;
+  });
+  f.run.mockImplementationOnce((delivery) => delivery.workingUntil?.(done));
+  f.emit({
+    events: [
+      event("1", {
+        tags: [
+          ["h", channel],
+          ["p", bot],
+        ],
+      }),
+    ],
+  });
+  try {
+    await vi.waitFor(() =>
+      expect(f.activity.reader.work()[0]?.state).toBe("working"),
+    );
+    const scope = f.activity.reader.work()[0]?.scope;
+    f.connect(false);
+    f.connect(true);
+    expect(f.activity.reader.work()[0]).toMatchObject({
+      state: "working",
+      scope,
+    });
+    finish({ ok: true });
+    await vi.waitFor(() =>
+      expect(f.activity.reader.work()[0]?.state).toBe("done"),
+    );
+    expect(f.run).toHaveBeenCalledTimes(1);
+  } finally {
+    finish({ ok: true });
+    await f.ctx.fiber.dispose();
+  }
+});
+
+it("does not label still-running work failed when only its handover deadline expires", async () => {
+  const f = await setup({ timeoutMs: 100 });
+  await f.service.create({ type: "example/echo", name: "Echo" });
+  let release!: () => void;
+  let expired!: () => void;
+  const deadline = new Promise<void>((resolve) => {
+    expired = resolve;
+  });
+  f.run.mockImplementationOnce((delivery) => {
+    delivery.signal.addEventListener("abort", expired, { once: true });
+    return new Promise<void>((resolve) => {
+      release = resolve;
+    });
+  });
+  f.emit({
+    events: [
+      event("1", {
+        tags: [
+          ["h", channel],
+          ["p", bot],
+        ],
+      }),
+    ],
+  });
+  const log = vi.spyOn(console, "error").mockImplementation(() => {});
+  try {
+    await vi.waitFor(() =>
+      expect(f.activity.reader.work()[0]?.state).toBe("working"),
+    );
+    await deadline;
+    await settle();
+    expect(f.activity.reader.work()[0]?.state).toBe("working");
+    release();
+    await vi.waitFor(() =>
+      expect(f.activity.reader.work()[0]?.state).toBe("done"),
+    );
+  } finally {
+    release?.();
+    log.mockRestore();
+    await f.ctx.fiber.dispose();
+  }
 });

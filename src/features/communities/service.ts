@@ -1,4 +1,5 @@
 // FOUNDATION: Client identity and membership selection outlive community query sessions.
+import type { LocalAgentSource } from "../agents2/activity";
 import type { AgentControl } from "../agents/control";
 import type { IdentityNames } from "../identity-names/service";
 import { createPresenceActivity } from "../presence/activity";
@@ -46,6 +47,7 @@ export function createCommunities(
   agentChoices?: Pick<AgentControl, "snapshot" | "subscribe" | "refresh">,
   identityReady?: Promise<string>,
   nativeConnect?: (id: string, signal: AbortSignal) => Promise<ReadTransport>,
+  localAgents?: LocalAgentSource,
 ) {
   const connect = live
     ? (id: string, signal: AbortSignal) =>
@@ -134,6 +136,7 @@ export function createCommunities(
         identityNames,
         agentChoices,
         viewer ? { viewer, scope: communityDestination(id).url } : undefined,
+        localAgents,
       );
       sessions.set(id, session);
       sessionScopes.set(id, scope);

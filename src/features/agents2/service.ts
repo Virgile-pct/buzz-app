@@ -1,3 +1,9 @@
+import {
+  createLocalAgentActivity,
+  type LocalAgentActivity,
+  type WorkOutcome,
+} from "./activity";
+import { threadReference } from "../relay/thread-reference";
 // Agents2: agents that are plugins from the start. A plugin registers an agent
 // type (its summary line, peek view, settings tabs and `run`); each agent made
 // from it has its own native-held key, an `agent-attention/v1` configuration the
@@ -131,6 +137,11 @@ export type Delivery<Config = unknown> = Readonly<{
   /** Aborts on the run's deadline, or when the agent is removed or its type is
    * replaced. Advisory: the handle keeps working, so finishing up is harmless. */
   signal: AbortSignal;
+  /** The actual work can outlive hand-over. A fulfilled promise must report its
+   * outcome; resolving {ok:false} is a failure, not successful completion. */
+  workingUntil?(done: PromiseLike<WorkOutcome>): void;
+  /** Reports the latest live step (the harness's tool name and target) for display. */
+  step?(tool: string, target?: string): void;
 }>;
 export type AgentType<Config = unknown> = {
   id: string;
@@ -147,6 +158,8 @@ export type AgentType<Config = unknown> = {
   Peek?: ComponentType<AgentPeekProps<Config>>;
   /** The type's settings tabs, in order. The host adds Attention after them. */
   tabs?: readonly AgentTab<Config>[];
+  /** Synchronous admission policy, rechecked before queued work starts. */
+  accepts?(trigger: Trigger, agent: Agent<Config>): boolean;
   run?(delivery: Delivery<Config>): void | Promise<void>;
   /** Per-run deadline in milliseconds, up to 30 minutes; defaults to 60 seconds. */
   timeoutMs?: number;
@@ -215,7 +228,12 @@ type Binding = {
   /** Aborts when this binding is replaced, so no work outlives its session. */
   controller: AbortController;
 };
-type Job = { trigger: Trigger; channelId?: string };
+type Job = {
+  scope?: string | undefined;
+  trigger: Trigger;
+  channelId?: string;
+  work?: ReturnType<LocalAgentActivity["begin"]>;
+};
 type WatchTrigger = Extract<Trigger, { type: "watch" }>;
 type CompiledWatch = Omit<WatchTrigger, "type" | "event"> & {
   filter?: ReturnType<typeof compileFilter>;
@@ -239,6 +257,7 @@ type Runner = {
   /** Whether native may hold the agent for this copy; true at first, since
    * native outlives a page reload. */
   mayHold: boolean;
+  activityClaimed: boolean;
   compiled?: {
     attention: Agent["attention"];
     watches: readonly CompiledWatch[];
@@ -267,9 +286,14 @@ export class Agents2Service extends Service implements Agents2 {
     private readonly relay: RelayData,
     private readonly native: AgentsNative | undefined = nativeAgents(),
     private readonly storage: Storage = globalThis.localStorage,
+    private readonly localActivity: LocalAgentActivity = createLocalAgentActivity(),
   ) {
     super(ctx, "agents2");
     this.contributions = createContributions<AgentType>(ctx);
+    localActivity.identities({
+      status: native ? "loading" : "unavailable",
+      identities: [],
+    });
     this.records = readRecords(storage);
     this.state = Object.freeze({
       status: native ? "loading" : "unavailable",
@@ -298,6 +322,11 @@ export class Agents2Service extends Service implements Agents2 {
         this.binding = undefined;
         for (const runner of this.runners.values()) this.retire(runner);
         this.runners.clear();
+        this.localActivity.clear();
+        this.localActivity.identities({
+          status: "unavailable",
+          identities: [],
+        });
         // Clear what is shown without reconciling, which would make new runners.
         this.state = Object.freeze({
           ...this.state,
@@ -485,6 +514,10 @@ export class Agents2Service extends Service implements Agents2 {
         error: message(error),
       });
     }
+    this.localActivity.identities({
+      status: this.state.status,
+      identities: this.identities,
+    });
     this.update();
     this.notify();
     this.sync();
@@ -637,6 +670,8 @@ export class Agents2Service extends Service implements Agents2 {
       if (!runner)
         this.runners.set(identity.pubkey, this.runner(identity, type));
       else if (runner.type !== type) {
+        this.localActivity.clear(undefined, identity.pubkey);
+        for (const job of runner.queue) delete job.work;
         runner.controller.abort();
         runner.controller = new AbortController();
         runner.type = type;
@@ -683,9 +718,11 @@ export class Agents2Service extends Service implements Agents2 {
       seen: new Set(),
       wrote: new Set(),
       mayHold: true,
+      activityClaimed: false,
     };
   }
   private retire(runner: Runner) {
+    this.localActivity.clear(undefined, runner.pubkey);
     runner.queue.length = 0;
     runner.controller.abort();
   }
@@ -812,18 +849,42 @@ export class Agents2Service extends Service implements Agents2 {
   }
 
   private enqueue(runner: Runner, job: Job) {
+    const agent = this.find(runner.pubkey);
+    if (agent && runner.type?.accepts?.(job.trigger, agent) === false) return;
+    job.scope ??= this.binding?.scope;
+    if (runner.activityClaimed) this.showWork(runner, job);
     const now = Date.now();
     if (now - runner.windowStart >= RATE_WINDOW_MS) {
       runner.windowStart = now;
       runner.admitted = 0;
     }
     if (runner.queue.length >= QUEUE_LIMIT || runner.admitted >= RATE_LIMIT) {
+      job.work?.finish({
+        ok: false,
+        error:
+          "Agent is busy and could not queue this request. Try again when it finishes.",
+      });
       console.warn(`Agent ${this.find(runner.pubkey)?.name} dropped an event`);
       return;
     }
     runner.admitted++;
     runner.queue.push(job);
     void this.drain(runner);
+  }
+
+  private showWork(runner: Runner, job: Job) {
+    if (job.work || job.trigger.type !== "mention" || !job.scope) return;
+    const event = job.trigger.event;
+    const channelId =
+      job.channelId ?? event.tags.find(([key]) => key === "h")?.[1];
+    if (!channelId) return;
+    job.work = this.localActivity.begin({
+      scope: job.scope,
+      agent: runner.pubkey,
+      channelId,
+      messageId: event.id,
+      threadRootId: threadReference(event)?.rootId ?? event.id,
+    });
   }
 
   // One run at a time per agent: events in arrival order, then a due timer.
@@ -841,7 +902,10 @@ export class Agents2Service extends Service implements Agents2 {
       const run = type?.run;
       // An agent this copy cannot run is left to another copy of the app.
       if (!agent || !type || !run) {
-        if (agent) runner.queue.length = 0;
+        if (agent) {
+          for (const job of runner.queue) job.work?.remove();
+          runner.queue.length = 0;
+        }
         await this.release(runner);
         // It may have come back into view, or gained its type, meanwhile.
         if (this.find(runner.pubkey) !== agent || runner.type !== type)
@@ -852,13 +916,25 @@ export class Agents2Service extends Service implements Agents2 {
       // one holding the agent runs them. Asked on every wake too, so a copy
       // takes over within a tick of the holder quitting or letting go.
       if (!(await this.claim(runner))) {
+        for (const job of runner.queue) job.work?.remove();
+        this.localActivity.clear(undefined, runner.pubkey);
+        runner.activityClaimed = false;
         runner.queue.length = 0;
         break;
       }
       // The agent or its type may have changed meanwhile.
       if (this.find(runner.pubkey) !== agent || runner.type !== type) continue;
+      runner.activityClaimed = true;
+      for (const pending of runner.queue) {
+        if (type.accepts?.(pending.trigger, agent) !== false)
+          this.showWork(runner, pending);
+      }
       const job = runner.queue.shift() ?? this.dueTimer(agent);
       if (!job) break;
+      if (type.accepts?.(job.trigger, agent) === false) {
+        job.work?.remove();
+        continue;
+      }
       const lifetime = runner.controller.signal;
       const signal = AbortSignal.any([
         lifetime,
@@ -876,29 +952,66 @@ export class Agents2Service extends Service implements Agents2 {
         remember: (slug: string, body: string, after: number) =>
           this.require().remember(agent.pubkey, slug, body, after),
       });
+      const work = job.work;
+      work?.started();
+      let holds = 1;
+      const settleWork = (result: WorkOutcome = { ok: true }) => {
+        if (holds === 0) return;
+        if (!result.ok) {
+          holds = 0;
+          lifetime.removeEventListener("abort", stopWork);
+          work?.finish(result);
+        } else if (--holds === 0) {
+          lifetime.removeEventListener("abort", stopWork);
+          work?.finish({ ok: true });
+        }
+      };
+      const stopWork = () => {
+        holds = 0;
+        work?.remove();
+      };
+      lifetime.addEventListener("abort", stopWork, { once: true });
+      const completion = Promise.resolve().then(() =>
+        run(
+          Object.freeze({
+            trigger: job.trigger,
+            ...(job.channelId ? { channelId: job.channelId } : {}),
+            agent: handle,
+            config: agent.config,
+            signal,
+            workingUntil: (done: PromiseLike<WorkOutcome>) => {
+              if (holds === 0) return;
+              holds++;
+              Promise.resolve(done).then(settleWork, (error) =>
+                settleWork({ ok: false, error: message(error) }),
+              );
+            },
+            step: (tool: string, target?: string) =>
+              job.work?.step(tool, target),
+          }),
+        ),
+      );
+      void completion.then(
+        () => settleWork(),
+        (error) => settleWork({ ok: false, error: message(error) }),
+      );
+      let onAbort: (() => void) | undefined;
       try {
         await Promise.race([
-          Promise.resolve().then(() =>
-            run(
-              Object.freeze({
-                trigger: job.trigger,
-                ...(job.channelId ? { channelId: job.channelId } : {}),
-                agent: handle,
-                config: agent.config,
-                signal,
-              }),
-            ),
-          ),
+          completion,
           new Promise<never>((_, reject) => {
-            if (signal.aborted) reject(signal.reason);
-            signal.addEventListener("abort", () => reject(signal.reason), {
-              once: true,
-            });
+            onAbort = () => reject(signal.reason);
+            if (signal.aborted) onAbort();
+            else signal.addEventListener("abort", onAbort, { once: true });
           }),
         ]);
       } catch (error) {
+        // The deadline only releases hand-over. Actual work can outlive it;
+        // its completion hook remains authoritative rather than inventing failure.
         if (!lifetime.aborted)
           console.error(`Agent run failed: ${agent.name}`, error);
+      } finally {
+        if (onAbort) signal.removeEventListener("abort", onAbort);
       }
     }
     runner.running = false;
@@ -921,6 +1034,7 @@ export class Agents2Service extends Service implements Agents2 {
   private async release(runner: Runner) {
     if (!runner.mayHold) return;
     runner.mayHold = false;
+    runner.activityClaimed = false;
     await this.native
       ?.release(runner.pubkey)
       .catch((error) =>

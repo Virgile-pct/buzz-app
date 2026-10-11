@@ -3,6 +3,7 @@ import { createMePreferences, meGroups } from "./me-preferences";
 import { npubEncode } from "nostr-tools/nip19";
 import { createMemberAdditions } from "../channel-members/operations";
 import { addChannelMember, startAddedAgent } from "../channel-members/members";
+import type { LocalAgentSource } from "../agents2/activity";
 import type { AgentControl } from "../agents/control";
 import type { GitRead } from "../projects/git";
 import { projectDestinations } from "../projects/destinations";
@@ -204,6 +205,7 @@ export function createRelaySession(
   transport: ReadTransport | null,
   options: ChannelStoreOptions & {
     identityNames?: IdentityNames | undefined;
+    localAgents?: LocalAgentSource | undefined;
     agentChoices?:
       | Pick<AgentControl, "snapshot" | "subscribe" | "refresh">
       | undefined;
@@ -676,6 +678,7 @@ export function createRelaySession(
     scope: transport ? transportPartition(transport) : "undefined:undefined",
     library: agentLibrary.queries,
     native: options.agentChoices,
+    plugins: options.localAgents,
     archives: archives.queries,
     signal: lifetime.signal,
   });
@@ -700,6 +703,9 @@ export function createRelaySession(
         }
       : undefined,
     (id) => recent.peek(id)?.event ?? retainedEvent(id),
+    options.localAgents && transport
+      ? { source: options.localAgents, scope: transportPartition(transport) }
+      : undefined,
   );
   const channelActivity = createChannelActivity(
     transport?.channelActivity

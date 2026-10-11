@@ -1,4 +1,5 @@
 import { readView } from "../../shared/view-state";
+import type { LocalAgentSource } from "../agents2/activity";
 import type { AgentControl } from "../agents/control";
 import type { IdentityNames } from "../identity-names/service";
 import type { PresenceActivity } from "../presence/activity";
@@ -50,6 +51,7 @@ export function provideRelay(
   identityNames?: IdentityNames,
   agentChoices?: Pick<AgentControl, "snapshot" | "subscribe" | "refresh">,
   resume?: { viewer: string; scope: string },
+  localAgents?: LocalAgentSource,
 ) {
   let disposed = false;
   let generation = 0;
@@ -211,6 +213,7 @@ export function provideRelay(
           const successor = createRelaySession(transport, {
             identityNames,
             agentChoices,
+            localAgents,
             ...(presenceActivity ? { presenceActivity } : {}),
             prepared: true,
             // Keep intent preparation, but do not fetch every unopened channel.

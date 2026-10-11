@@ -412,27 +412,65 @@ feedback on them. Broader agent architecture proposals are outside the V1 scope.
 
 ## Agent Activity plugin
 
-**Agent Activity** is an independently toggleable bundled plugin that owns capture
-and the transcript panel. Conversation presentation uses a compact, floating
-avatar control above the composer, without a reserved strip or permanent avatar
-container. Hover, click, tap or keyboard opens **Working now**, reusing the sidebar's
-working-agent row. The row opens its known thread (or channel when no unique thread
-is known); a separate **View activity** action opens the agent's transcript.
+**Agent Activity** owns live capture demand and the full Transcript/Raw panel;
+host-owned saved history remains independent of plugin enablement. This branch
+adds an avatar-and-dots bubble beneath the exact message that triggered current
+work. Multiple turns group by agent; completing one turn does not hide another.
+Hover, click, tap or keyboard opens a compact avatar-and-latest-tool popup. Its
+row opens that exact agent's profile Activity tab, using the mainline transcript,
+conversation filtering and saved-history controls. Escape or outside click closes
+the popup. Human typing remains in the ordinary conversation indicator.
 
-The channel control includes work in threads. A thread control includes only
-exact-root evidence, never unconfirmed work. Current owner-visible turns provide
-brief tool status; unknown scopes fall back to channel activity. Multiple concurrent
-scopes never choose an arbitrary transcript thread. Public typing for the viewer's
-own `agentChoices` identities remains visible without telemetry; someone else's
-self-declared agent remains ordinary typing, without this owner-activity doorway.
-All projections consume existing stores and loaded profiles/channel rows, not new
-capture leases, relay reads or timers. A persistent, visually hidden status region
-announces working/typing transitions even when visual controls are absent.
+### Local plugin-agent lifecycle
 
-The popup resets on conversation changes and when current work ends. Idle and
-historical activity remain accessible from profiles and the activity panel rather
-than lingering above the composer. Compact status labels omit raw arguments and
-full paths; the transcript retains the detail.
+Agents2 supplies local request facts through `features/agents2/activity.ts`, created
+by the app and passed read-only through community sessions. The existing host
+owns admission and queuing; Claude and Codex report the actual outcome through
+`Delivery.workingUntil`. A resolved `{ok:false}` is a failure, not success.
+The host's handover deadline still releases the delivery queue but does not claim
+that handed-off work stopped. No relay publication, new timer, runner, or runtime
+pin change is added. These facts describe the copy of the app running the agent;
+other devices are outside this slice.
+
+The exact agent, community, channel, thread root and triggering message stay
+attached to each request. Waiting requests breathe in unison, and handover into
+plugin execution switches to staggered working dots. Preparation, thinking,
+typing and tool use are all working. True plugin completion removes activity;
+failure remains beneath the triggering message with a bounded explanation.
+A newer handling of the same message cannot be overwritten by an old callback.
+The display retains at most 512 entries, discarding settled ones first. It is
+in-memory, not a durable job ledger; reload starts empty.
+
+Sidebar, thread summaries and message bubbles read that same session projection.
+`agentChoices` includes the current owner's native plugin identities in the exact
+community, without changing template eligibility or creating a second inventory.
+The message popup opens the plugin agent's profile rather than pretending that
+an ACP transcript exists. Plugin transcript improvements remain owned by #842.
+Claim failure due to another app copy shows no local receipt. Plugin policy is
+checked before admission and again before queued work runs. Removal, plugin
+replacement and app disposal retire the corresponding callbacks and display.
+
+The host queue and execution policy are unchanged. Existing community-switch
+behavior remains until #838 is integrated; this change records each job's source
+community and does not reopen or run hidden communities. Open #792's public
+typing transport is not needed for local display and remains separate work.
+The common lifetime-hook name is retained, with explicit outcomes rather than
+assuming that a settled promise succeeded. Coordinate that contract before
+combining the branches.
+
+Legacy ACP agents retain their existing owner-visible feed. Their message bubbles
+still require a live start with explicit triggering IDs. Restored records never
+create bubbles or live request associations. Typing-only/unassociated work keeps
+the existing conversation control. No experiment-specific `request_state` parser,
+run/revision protocol, repeated status publisher or second runtime is used here.
+The separate upstream experiment is preserved but is not part of this app change.
+
+The compact preview and full panel read the shared transcript projection. The
+preview prefers the latest tool in a live turn, falling back to thought, response
+or plan text, and retains the branch's exact-tool compact labels. Stale linked
+work stops animating; completed work leaves the message. History stays available
+from profiles and the panel. No additional capture owner, relay read or timer is
+introduced by these presentations.
 
 Thread indicators consume the existing kind-20002 typing signal with the resolved
 NIP-10 root, not inferred observer turn IDs. The existing per-channel live route

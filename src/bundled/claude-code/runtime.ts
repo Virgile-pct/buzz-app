@@ -139,7 +139,14 @@ export class ClaudeRuntime {
     this.agents.clear();
   }
 
-  async run({ trigger, agent, config: raw, channelId }: Delivery) {
+  async run({
+    trigger,
+    agent,
+    config: raw,
+    channelId,
+    workingUntil,
+    step,
+  }: Delivery) {
     const settings = config(raw);
     if (
       trigger.type !== "timer" &&
@@ -193,7 +200,9 @@ export class ClaudeRuntime {
     const done = entry.sessions.deliver(key, text, event.created_at, {
       steer: steerPrompt(text),
       fresh: async () => (await prompt(true)).text,
+      ...(step ? { step } : {}),
     });
+    workingUntil?.(done);
     this.notify();
     this.watch(done, async (error) => {
       if (error) await this.report(agent, channel, event, error);
