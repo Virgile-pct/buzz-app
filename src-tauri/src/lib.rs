@@ -669,7 +669,7 @@ pub fn run() {
                 )
             },
             || {
-                federated_identity::store::remove_all()?;
+                federated_identity::store::remove_all(federated_identity::store::root()?)?;
                 identity::remove_saved_key()
             },
         )
