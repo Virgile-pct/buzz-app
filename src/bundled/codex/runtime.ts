@@ -1,7 +1,9 @@
-import type {
-  Agent,
-  AgentHandle,
-  Delivery,
+import {
+  fromOwner,
+  type Agent,
+  type AgentHandle,
+  type Delivery,
+  type Models,
 } from "../../features/agents2/service";
 import type { RelayData } from "../../features/relay/service";
 import type { EventData } from "../../features/relay/events";
@@ -9,7 +11,9 @@ import { appClient } from "../../buzz-mcp/app-client";
 import { TOOLS, callTool } from "../../buzz-mcp/tools";
 import {
   config,
+  defaults,
   absoluteWorkspace,
+  effortName,
   validWorkspace,
   type Config,
 } from "./config";
@@ -30,6 +34,8 @@ import {
 } from "./rpc";
 
 type Request = {
+  /** The agent's community and owner, as `origin:viewer`. */
+  scope: string;
   event: EventData;
   agent: AgentHandle;
   settings: Config;
@@ -37,11 +43,18 @@ type Request = {
   /** Latest request's thread, independent of session scope; absent in DMs. */
   toolRoot?: string;
   interest: string;
+  /** The model and effort the owner picked for this turn. */
+  model?: string;
+  effort?: string;
+  /** Called once a final send answers this request, or one steered after it. */
+  answered: () => void;
 };
 /** `at` is when the binding last started a turn; bindings saved before it
  * existed have none. */
 type Saved = { threadId: string; workspace: string; at?: number };
 type Active = {
+  /** The server this turn runs on; steering must reach the same process. */
+  rpc: AppServer;
   threadId?: string;
   turnId?: string;
   ready: Promise<void>;
@@ -52,6 +65,8 @@ type Active = {
   signal: AbortSignal;
   version: number;
   sentVersion?: number;
+  /** Every request this turn has taken in, the first and each steered one. */
+  requests: Request[];
 };
 type Lane = {
   tail: Promise<void>;
@@ -60,10 +75,16 @@ type Lane = {
 type Entry = {
   storageKey: string;
   abort: AbortController;
-  rpc: AppServer;
-  opening: Promise<AppServer>;
+  /** Settles once the same agent's previous run has let go of its threads. */
+  after: Promise<void>;
   lanes: Map<string, Lane>;
   saved: Record<string, Saved>;
+};
+type Server = {
+  rpc: AppServer;
+  opening: Promise<AppServer>;
+  /** Threads this process has loaded, and the agent each belongs to. */
+  threads: Map<string, string>;
 };
 export type SessionView = { key: string; status: string; detail: string };
 /** A saved binding, newest first, for the owner's transcript list. */
@@ -88,15 +109,21 @@ function textOf(event: EventData, name: string) {
 }
 
 /** Agents2 owns admission/identity. This plugin owns work after hand-over, and
- * uses one app-server per agent with independent Codex threads per conversation. */
+ * uses one app-server for every agent. Each conversation is its own Codex
+ * thread carrying its agent's workspace, instructions and tools, and tool
+ * calls find their agent by thread and turn. */
 export class CodexRuntime {
   private entries = new Map<string, Entry>();
+  private server: Server | undefined;
+  private stopping = new Map<string, Promise<void>>();
   private views = new Map<string, readonly SessionView[]>();
   private listeners = new Set<() => void>();
-  private scope = "";
+  /** Read-only model discovery, kept per agent until its settings change. */
+  private previews = new Map<string, { key: string; ready: Promise<Models> }>();
   constructor(
     private readonly spawn: Spawn,
-    private readonly relay: RelayData,
+    /** The owner's connection to each agent's own community. */
+    private readonly relay: (pubkey: string) => RelayData | undefined,
     private readonly storage: Storage = localStorage,
   ) {}
   subscribe = (listener: () => void) => {
@@ -107,7 +134,79 @@ export class CodexRuntime {
   };
   sessions = (pubkey: string): readonly SessionView[] =>
     this.views.get(pubkey) ?? EMPTY;
+  preview(agent: Agent) {
+    const settings = config(agent.config);
+    const key = JSON.stringify([
+      settings.workspace,
+      settings.model,
+      settings.effort,
+    ]);
+    const existing = this.previews.get(agent.pubkey);
+    if (existing?.key === key) return existing.ready;
+    const server = this.open();
+    const rpc = server.rpc;
+    const ready = (async () => {
+      const workspace = await this.workspace(settings.workspace);
+      await server.opening;
+      const normalized = await rpc.request<{
+        config: { model?: string | null };
+      }>("config/read", { cwd: workspace });
+      const models = await listModels(rpc);
+      const model =
+        settings.model ||
+        normalized.config.model ||
+        models.find((row) => row.isDefault)?.model;
+      const offered = models.map((row) => {
+        const efforts = row.supportedReasoningEfforts.map(
+          ({ reasoningEffort: id }) => ({ id, label: effortName(id) }),
+        );
+        // As a run picks it: the configured effort if the model has it.
+        const effort = efforts.some((level) => level.id === settings.effort)
+          ? settings.effort
+          : row.defaultReasoningEffort;
+        return {
+          id: row.model,
+          label: row.displayName || row.model,
+          efforts,
+          ...(effort ? { effort } : {}),
+        };
+      });
+      // A configured model this Codex does not list still leaves the
+      // listed ones to pick, so the picker stays.
+      return !model || models.some((row) => row.model === model)
+        ? { current: model ?? "", models: offered }
+        : {
+            current: model,
+            models: [{ id: model, label: model, efforts: [] }, ...offered],
+          };
+    })();
+    const entry = { key, ready };
+    this.previews.set(agent.pubkey, entry);
+    void ready.catch(() => {
+      if (this.previews.get(agent.pubkey) === entry)
+        this.previews.delete(agent.pubkey);
+    });
+    return ready;
+  }
+
+  private async workspace(path: string) {
+    if (absoluteWorkspace(path)) return path;
+    let directory = "";
+    const process = await this.spawn("workspace", {
+      cwd: path,
+      onStdout: (data) => {
+        directory += data;
+      },
+    });
+    const code = await process.exited;
+    const workspace = directory.trim();
+    if (code !== 0 || !absoluteWorkspace(workspace))
+      throw new Error("Could not resolve the default Codex workspace.");
+    return workspace;
+  }
   private status(pubkey: string, key: string, status: string, detail = "") {
+    // A stopped agent's draining turns don't bring its sessions back.
+    if (!this.entries.has(pubkey)) return;
     const others = this.sessions(pubkey).filter((view) => view.key !== key);
     this.views.set(pubkey, [
       ...others.slice(-31),
@@ -115,63 +214,98 @@ export class CodexRuntime {
     ]);
     for (const listener of this.listeners) listener();
   }
-  sync(agents: readonly Agent[], scope: string) {
-    if (scope !== this.scope) {
-      this.dispose();
-      this.scope = scope;
-    }
+  sync(agents: readonly Agent[]) {
     const present = new Set(agents.map((agent) => agent.pubkey));
+    for (const pubkey of this.previews.keys())
+      if (!present.has(pubkey)) {
+        this.previews.delete(pubkey);
+      }
     for (const [pubkey, entry] of this.entries)
       if (!present.has(pubkey)) {
         entry.abort.abort();
-        void entry.rpc.close();
         this.entries.delete(pubkey);
         this.views.delete(pubkey);
+        if (this.server) this.stop(this.server, pubkey, entry);
       }
+    if (!present.size) this.close();
     for (const listener of this.listeners) listener();
   }
+  /** Other agents share the server, so a stopped agent's turns interrupt
+   * themselves. Then the shells its finished turns left are ended, which its
+   * own process used to do by exiting. Until then, the same agent starting
+   * again waits rather than resuming a thread that is still letting go. */
+  private stop(server: Server, pubkey: string, entry: Entry) {
+    const stopped = (async () => {
+      await Promise.all(
+        [...entry.lanes.values()].map((lane) =>
+          lane.tail.catch(() => undefined),
+        ),
+      );
+      for (const [threadId, owner] of server.threads)
+        if (owner === pubkey) {
+          server.threads.delete(threadId);
+          await server.rpc
+            .request("thread/backgroundTerminals/clean", { threadId })
+            .catch(() => undefined);
+        }
+    })();
+    this.stopping.set(pubkey, stopped);
+    void stopped.finally(() => {
+      if (this.stopping.get(pubkey) === stopped) this.stopping.delete(pubkey);
+    });
+  }
   dispose() {
-    for (const entry of this.entries.values()) {
-      entry.abort.abort();
-      void entry.rpc.close();
-    }
+    this.previews.clear();
+    for (const entry of this.entries.values()) entry.abort.abort();
     this.entries.clear();
     this.views.clear();
+    this.stopping.clear();
+    this.close();
+  }
+  private close() {
+    void this.server?.rpc.close();
+    this.server = undefined;
+  }
+  private open() {
+    if (this.server) return this.server;
+    const rpc = new AppServer((call) => this.tool(call));
+    // Threads set their own cwd; the process just needs a directory that exists.
+    const server: Server = {
+      rpc,
+      opening: rpc.open(this.spawn, defaults.workspace),
+      threads: new Map(),
+    };
+    // An exit fails current work and permits the next ordinary mention to reopen.
+    rpc.onMessage((wire) => {
+      if (wire.method === "connection/closed" && this.server === server)
+        this.server = undefined;
+    });
+    void server.opening.catch(() => {
+      if (this.server === server) this.server = undefined;
+      void rpc.close();
+    });
+    this.server = server;
+    return server;
   }
   private entry(request: Request) {
     const pubkey = request.agent.pubkey;
     const prior = this.entries.get(pubkey);
     if (prior) return prior;
-    const saved = this.load(pubkey);
-    const rpc = new AppServer((call) => this.tool(entry, call));
+    const saved = this.load(this.storageKey(request.scope, pubkey));
     const entry: Entry = {
-      storageKey: this.storageKey(pubkey),
+      storageKey: this.storageKey(request.scope, pubkey),
       abort: new AbortController(),
-      rpc,
+      after: this.stopping.get(pubkey) ?? Promise.resolve(),
       saved,
       lanes: new Map(),
-      opening: rpc.open(this.spawn, request.settings.workspace),
     };
-    // An exit fails current work and permits the next ordinary mention to reopen.
-    rpc.onMessage((wire) => {
-      if (
-        wire.method === "connection/closed" &&
-        this.entries.get(pubkey) === entry
-      ) {
-        this.entries.delete(pubkey);
-      }
-    });
-    void entry.opening.catch(() => {
-      if (this.entries.get(pubkey) === entry) this.entries.delete(pubkey);
-      void rpc.close();
-    });
     this.entries.set(pubkey, entry);
     return entry;
   }
-  private load(pubkey: string) {
+  private load(storageKey: string) {
     try {
       const stored: unknown = JSON.parse(
-        this.storage.getItem(this.storageKey(pubkey)) ?? "{}",
+        this.storage.getItem(storageKey) ?? "{}",
       );
       if (stored && typeof stored === "object" && !Array.isArray(stored))
         return Object.fromEntries(
@@ -189,12 +323,12 @@ export class CodexRuntime {
   }
   /** The agent's most recently used bindings in this community. */
   conversations(pubkey: string): SavedConversation[] {
-    const saved = this.entries.get(pubkey)?.saved ?? this.load(pubkey);
-    const snapshot = this.relay.snapshot();
-    const channels =
-      snapshot.status === "ready"
-        ? snapshot.session.channels.list().channels
-        : [];
+    const snapshot = this.relay(pubkey)?.snapshot();
+    const ready = snapshot?.status === "ready" ? snapshot : undefined;
+    const saved =
+      this.entries.get(pubkey)?.saved ??
+      (ready ? this.load(this.storageKey(ready.scope ?? "", pubkey)) : {});
+    const channels = ready?.session.channels.list().channels ?? [];
     // Untimestamped bindings keep save order, newest last; listed newest first.
     return Object.entries(saved)
       .reverse()
@@ -221,9 +355,9 @@ export class CodexRuntime {
       .sort((a, b) => (b.at ?? 0) - (a.at ?? 0))
       .slice(0, CONVERSATION_LIMIT);
   }
-  private storageKey(pubkey: string) {
+  private storageKey(scope: string, pubkey: string) {
     // Resume restores the persisted tool schema; pre-tools bindings start fresh.
-    return `buzz.codex.sessions.v3:${this.scope}:${pubkey}`;
+    return `buzz.codex.sessions.v3:${scope}:${pubkey}`;
   }
   private save(request: Request, entry: Entry, key: string, saved: Saved) {
     // Reinserted so the bounded set keeps the most recently used bindings.
@@ -249,9 +383,9 @@ export class CodexRuntime {
       throw new Error(
         "Codex timers are not supported yet; use mentions or event watches.",
       );
-    if (trigger.event.pubkey !== agent.owner) return;
-    const snapshot = this.relay.snapshot();
-    if (snapshot.status !== "ready")
+    if (!(await fromOwner(trigger.event, agent.owner))) return;
+    const snapshot = this.relay(agent.pubkey)?.snapshot();
+    if (snapshot?.status !== "ready")
       throw new Error("Connect to the agent's community first");
     const channelId = delivery.channelId;
     if (!channelId) throw new Error("The event has no unambiguous channel");
@@ -262,11 +396,20 @@ export class CodexRuntime {
     const toolRoot =
       channel?.channelType === "dm" ? undefined : rootOf(trigger.event);
     const root = settings.scope === "channel" ? undefined : toolRoot;
+    let answered!: () => void;
+    // Codex makes one more model call after a final send before its turn
+    // ends; the agent is done working on this request once it has replied.
+    const replied = new Promise<void>((resolve) => {
+      answered = resolve;
+    });
     const request: Request = {
+      scope: snapshot.scope ?? "",
       event: trigger.event,
       agent,
       settings,
       ...(toolRoot ? { toolRoot } : {}),
+      ...(delivery.model ? { model: delivery.model } : {}),
+      ...(delivery.effort ? { effort: delivery.effort } : {}),
       conversation: {
         channelId,
         name: channel?.name ?? channelId,
@@ -274,6 +417,7 @@ export class CodexRuntime {
       },
       interest:
         trigger.type === "watch" ? (trigger.interest?.instructions ?? "") : "",
+      answered,
     };
     if (!validWorkspace(settings.workspace)) {
       await this.publish(
@@ -287,7 +431,7 @@ export class CodexRuntime {
     const entry = this.entry(request);
     let lane = entry.lanes.get(key);
     if (!lane) {
-      lane = { tail: Promise.resolve() };
+      lane = { tail: entry.after };
       entry.lanes.set(key, lane);
     }
     if (lane.active) {
@@ -307,7 +451,7 @@ export class CodexRuntime {
             this.start(request, text, key, lane, entry);
             return;
           }
-          await entry.rpc.request("turn/steer", {
+          await active.rpc.request("turn/steer", {
             threadId: active.threadId,
             expectedTurnId: active.turnId,
             input: input(
@@ -315,6 +459,7 @@ export class CodexRuntime {
             ),
           });
           active.reply = request;
+          active.requests.push(request);
           active.version++;
         } catch (error) {
           if (entry.abort.signal.aborted) return;
@@ -332,9 +477,16 @@ export class CodexRuntime {
       active.steering = accepted.catch((error) =>
         console.error("Codex steering failed", error),
       );
+      // The steered turn, or one started in its place, answers this mention.
+      const steered = lane;
+      delivery.workingUntil(
+        Promise.race([replied, accepted.then(() => steered.tail)]),
+      );
       return;
     }
-    this.start(request, text, key, lane, entry);
+    delivery.workingUntil(
+      Promise.race([replied, this.start(request, text, key, lane, entry)]),
+    );
   }
   private start(
     request: Request,
@@ -358,31 +510,31 @@ export class CodexRuntime {
       .finally(() => {
         if (current.tail === job && !current.active) entry.lanes.delete(key);
       });
+    return job;
   }
   private async history(request: Request, signal: AbortSignal) {
     signal.throwIfAborted();
-    const snapshot = this.relay.snapshot();
-    if (snapshot.status !== "ready" || snapshot.scope !== this.scope)
+    const snapshot = this.relay(request.agent.pubkey)?.snapshot();
+    if (snapshot?.status !== "ready" || snapshot.scope !== request.scope)
       throw new Error("The community changed");
     return conversationHistory(request.event, request.conversation, (filters) =>
       snapshot.session.read(filters, { signal }),
     );
   }
   private publish(request: Request, content: string) {
-    const root = rootOf(request.event);
     return request.agent.publish({
       kind: 9,
       content,
       tags: [
         ["h", request.conversation.channelId],
-        ...(root === request.event.id ? [] : [["e", root, "", "root"]]),
-        ["e", request.event.id, "", "reply"],
+        ["e", rootOf(request.event), "", "reply"],
         ["p", request.event.pubkey],
       ],
     });
   }
-  private async tool(entry: Entry, call: ToolCall): Promise<ToolReply> {
-    const active = [...entry.lanes.values()]
+  private async tool(call: ToolCall): Promise<ToolReply> {
+    const active = [...this.entries.values()]
+      .flatMap((entry) => [...entry.lanes.values()])
       .map((lane) => lane.active)
       .find(
         (active) =>
@@ -409,14 +561,15 @@ export class CodexRuntime {
     const args = call.arguments as Record<string, unknown>;
     const version = active.version;
     const request = active.reply;
+    const answering = [...active.requests];
     const client = appClient(request.agent, {
       spawn: this.spawn,
       cwd: active.workspace,
       check,
       signal: active.signal,
       memories: async () => {
-        const snapshot = this.relay.snapshot();
-        if (snapshot.status !== "ready" || snapshot.scope !== this.scope)
+        const snapshot = this.relay(request.agent.pubkey)?.snapshot();
+        if (snapshot?.status !== "ready" || snapshot.scope !== request.scope)
           throw new Error("Buzz is not connected to this community");
         const view = snapshot.session.agentMemories.open(request.agent.pubkey);
         const abort = () => view.dispose();
@@ -441,15 +594,12 @@ export class CodexRuntime {
         ...(request.toolRoot ? { root: request.toolRoot } : {}),
       },
       call.tool,
-      call.tool === "send" &&
-        args.reply === undefined &&
-        args.channel === undefined
-        ? { ...args, reply: request.event.id }
-        : args,
+      args,
     );
     const final = call.tool === "send" && args.final === true;
     if (final) {
       active.sentVersion = Math.max(active.sentVersion ?? -1, version);
+      for (const taken of answering) taken.answered();
     }
     return { success: true, contentItems: [{ type: "inputText", text }] };
   }
@@ -501,12 +651,14 @@ export class CodexRuntime {
     let ready!: () => void;
     let notReady!: (error: unknown) => void;
     const turnAbort = new AbortController();
+    const server = this.open();
     const signal = AbortSignal.any([
       entry.abort.signal,
       turnAbort.signal,
       AbortSignal.timeout(29 * 60_000),
     ]);
     const active: Active = {
+      rpc: server.rpc,
       ready: new Promise((resolve, reject) => {
         ready = resolve;
         notReady = reject;
@@ -517,6 +669,7 @@ export class CodexRuntime {
       workspace: request.settings.workspace,
       signal,
       version: 0,
+      requests: [request],
     };
     void active.ready.catch(() => undefined);
     lane.active = active;
@@ -530,7 +683,7 @@ export class CodexRuntime {
     void completed.catch(() => undefined);
     const abort = () => fail(signal.reason);
     signal.addEventListener("abort", abort, { once: true });
-    const off = entry.rpc.onMessage((wire) => {
+    const off = server.rpc.onMessage((wire) => {
       const p = wire.params as
         | {
             threadId?: string;
@@ -571,25 +724,12 @@ export class CodexRuntime {
       }
     });
     try {
-      const rpc = await entry.opening;
+      const rpc = await server.opening;
       signal.throwIfAborted();
       // The process host expands ~/.buzz and creates it; Codex's RPC needs
       // an absolute path rather than shell-style home notation.
-      let workspace = settings.workspace;
-      if (!absoluteWorkspace(workspace)) {
-        let directory = "";
-        const process = await this.spawn("workspace", {
-          cwd: workspace,
-          onStdout: (data) => {
-            directory += data;
-          },
-        });
-        const code = await process.exited;
-        workspace = directory.trim();
-        if (code !== 0 || !absoluteWorkspace(workspace))
-          throw new Error("Could not resolve the default Codex workspace.");
-        signal.throwIfAborted();
-      }
+      const workspace = await this.workspace(settings.workspace);
+      signal.throwIfAborted();
       active.workspace = workspace;
       const existing = entry.saved[key];
       const normalized = await rpc.request<{
@@ -599,16 +739,26 @@ export class CodexRuntime {
         };
       }>("config/read", { cwd: workspace });
       const models = await listModels(rpc);
-      const model =
+      const own =
         settings.model ||
         normalized.config.model ||
         models.find((row) => row.isDefault)?.model;
-      const selected = models.find((row) => row.model === model);
+      // Model and effort are per turn, so a pick changes nothing after it.
+      const picked = models.find((row) => row.model === request.model);
+      const selected = picked ?? models.find((row) => row.model === own);
       if (!selected)
         throw new Error(
           "The selected Codex model is unavailable. Choose an available model in Settings.",
         );
-      const effort = settings.effort || selected.defaultReasoningEffort;
+      const model = selected.model;
+      const supported = selected.supportedReasoningEfforts.map(
+        (level) => level.reasoningEffort,
+      );
+      // A picked model may not support the configured effort.
+      const effort =
+        [request.effort, settings.effort].find(
+          (level) => level && supported.includes(level),
+        ) ?? selected.defaultReasoningEffort;
       const mcp = Object.fromEntries(
         Object.entries(normalized.config.mcp_servers ?? {}).map(
           ([name, server]) => [
@@ -664,6 +814,7 @@ export class CodexRuntime {
         });
       }
       active.threadId = started.thread.id;
+      server.threads.set(active.threadId, agent.pubkey);
       signal.throwIfAborted();
       await rpc.request("thread/name/set", {
         threadId: active.threadId,
@@ -714,23 +865,21 @@ export class CodexRuntime {
         this.status(agent.pubkey, key, "Idle");
       }
     } catch (error) {
+      const ended = active.finished;
       active.finished = true;
       notReady(error);
       await active.steering;
-      if (
-        signal.aborted &&
-        active.threadId &&
-        active.turnId &&
-        !entry.abort.signal.aborted
-      ) {
+      // Other agents share the server, so even a stopped agent interrupts
+      // its turn rather than ending the process.
+      if (signal.aborted && !ended && active.threadId && active.turnId) {
         try {
-          await entry.rpc.request("turn/interrupt", {
+          await server.rpc.request("turn/interrupt", {
             threadId: active.threadId,
             turnId: active.turnId,
           });
-          await this.terminals(entry.rpc, active.threadId);
+          await this.terminals(server.rpc, active.threadId);
         } catch {
-          await entry.rpc.close();
+          await server.rpc.close();
         }
       }
       if (!entry.abort.signal.aborted) {
@@ -746,10 +895,10 @@ export class CodexRuntime {
       off();
       // Release the subscription before the next resume: loaded-thread rejoin
       // ignores instruction/config overrides while a client is subscribed.
-      if (active.threadId && !entry.abort.signal.aborted)
-        await entry.rpc
+      if (active.threadId)
+        await server.rpc
           .request("thread/unsubscribe", { threadId: active.threadId })
-          .catch(() => entry.rpc.close());
+          .catch(() => server.rpc.close());
       if (lane.active === active) delete lane.active;
     }
   }

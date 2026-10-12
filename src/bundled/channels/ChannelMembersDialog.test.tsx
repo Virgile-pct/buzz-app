@@ -1,6 +1,13 @@
 // @vitest-environment jsdom
 import "@testing-library/jest-dom/vitest";
-import { act, cleanup, render, screen, within } from "@testing-library/react";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  within,
+} from "@testing-library/react";
 import { createHash } from "node:crypto";
 import { schnorr } from "@noble/curves/secp256k1.js";
 import { bytesToHex } from "nostr-tools/utils";
@@ -14,8 +21,7 @@ import { matchesEvent } from "../../features/relay/projection";
 import type { RelayEvent } from "../../features/relay/events";
 import { PublishRejected } from "../../features/relay/outbox";
 import type { AgentLibrary } from "../../features/agents/library";
-import { createAgentControl } from "../../features/agents/control";
-import { controlFixture } from "../../features/agents/control-testing";
+import { localAgentsFixture } from "../../features/agents/local-testing";
 import { ToastProvider } from "../../shared/design-system/ui/Toast";
 import { profileTarget } from "../../features/profiles/target";
 import { ChannelMembersButton } from "./ChannelMembersDialog";
@@ -49,6 +55,8 @@ beforeEach(() => {
   });
 });
 afterEach(async () => {
+  // First, so a failed paging test cannot leak its fake clock into the next setup().
+  vi.useRealTimers();
   for (const task of tasks) task.controller.abort();
   await Promise.all(tasks.splice(0).map(({ outcome }) => outcome));
   cleanup();
@@ -68,16 +76,18 @@ async function setup(
     onOpenLink(target: string, returnFocus?: HTMLElement): boolean;
   },
 ) {
-  const fixture = controlFixture();
-  fixture.agent.status = "stopped";
-  const control = createAgentControl(fixture.host);
-  await control.refresh();
-  stops.push(control.dispose);
   const viewer = keypair(),
     relay = keypair(),
     person = keypair();
+  const agent = {
+    pubkey: "ab".repeat(32),
+    name: "Fixture agent",
+    relayUrl: "wss://relay.example.test",
+    owner: viewer.pubkey,
+  };
+  const control = localAgentsFixture([agent]);
   const id = "11111111-1111-4111-8111-111111111111";
-  const target = localAgent ? fixture.agent.pubkey : person.pubkey;
+  const target = localAgent ? agent.pubkey : person.pubkey;
   const members = [viewer.pubkey];
   let clock = 1700000000;
   let failure = "";
@@ -160,7 +170,6 @@ async function setup(
       <ChannelMembersButton
         session={owner.session}
         channelId={id}
-        control={control}
         {...navigation}
       />
     </ToastProvider>,
@@ -173,7 +182,7 @@ async function setup(
   return {
     user,
     trigger,
-    fixture,
+    agent,
     control,
     dispose: owner.dispose,
     publish,
@@ -461,7 +470,7 @@ it("one refresh retries every failed data source and never replays a failed invi
   expect(screen.getByText(/Invitation denied/)).toBeVisible();
 });
 
-it.each(["search", "archives", "agents", "native agents"])(
+it.each(["search", "archives", "agents"])(
   "keeps the shared refresh busy until %s settle, then permits recovery",
   async (source) => {
     const t = await setup();
@@ -483,8 +492,6 @@ it.each(["search", "archives", "agents", "native agents"])(
       throw new Error("Held read failed");
     };
     if (source === "agents") t.readAgentLibrary.mockImplementationOnce(hold);
-    else if (source === "native agents")
-      vi.spyOn(t.fixture.host, "snapshot").mockImplementationOnce(hold);
     else
       t.query.mockImplementation(async (filters) => {
         if (
@@ -562,129 +569,6 @@ it("refresh restarts the current directory query from page one instead of mixing
   ).toEqual([1]);
   expect(screen.getByRole("searchbox")).toHaveValue("Morgan");
 });
-
-it("finishes confirmed local-agent startup after closing and reopening during publication", async () => {
-  const t = await setup("stream", false, true);
-  t.hold();
-  await t.user.click(await t.search());
-  await vi.waitFor(() => expect(t.publish).toHaveBeenCalledOnce());
-  await t.user.keyboard("{Escape}");
-  await vi.waitFor(() =>
-    expect(screen.queryByRole("dialog")).not.toBeInTheDocument(),
-  );
-  await t.user.click(screen.getByRole("button", { name: "Channel members" }));
-  await t.search();
-  expect(screen.getByText("Adding…")).toBeVisible();
-  await act(async () => t.release());
-  await vi.waitFor(() =>
-    expect(t.control.snapshot().data?.agents[0]?.status).toBe("running"),
-  );
-  expect(t.publish).toHaveBeenCalledOnce();
-  expect(
-    t.fixture.calls.filter((call) => call.action === "start"),
-  ).toHaveLength(1);
-});
-
-it("keeps closed-dialog startup failures recoverable without another membership write", async () => {
-  const t = await setup("stream", false, true);
-  const action = t.fixture.host.action;
-  vi.spyOn(t.fixture.host, "action")
-    .mockRejectedValueOnce(new Error("Missing credentials"))
-    .mockImplementation(action);
-  t.hold();
-  await t.user.click(await t.search());
-  await vi.waitFor(() => expect(t.publish).toHaveBeenCalledOnce());
-  await t.user.keyboard("{Escape}");
-  await vi.waitFor(() =>
-    expect(screen.queryByRole("dialog")).not.toBeInTheDocument(),
-  );
-  await act(async () => t.release());
-  await vi.waitFor(() =>
-    expect(t.session.memberAdditions.snapshot()[0]?.error).toContain(
-      "agent did not start",
-    ),
-  );
-  await t.user.click(screen.getByRole("button", { name: "Channel members" }));
-  await screen.findByText(/Added to the channel, but the agent did not start/);
-  await t.user.click(screen.getByRole("button", { name: "Retry" }));
-  await vi.waitFor(() =>
-    expect(t.control.snapshot().data?.agents[0]?.status).toBe("running"),
-  );
-  expect(t.publish).toHaveBeenCalledOnce();
-  expect(t.session.memberAdditions.snapshot()).toEqual([]);
-});
-
-it("does not start the agent after its relay session is disposed", async () => {
-  const t = await setup("stream", false, true);
-  t.hold();
-  await t.user.click(await t.search());
-  await vi.waitFor(() => expect(t.publish).toHaveBeenCalledOnce());
-  cleanup();
-  await act(async () => t.dispose());
-  await act(async () => t.release());
-  expect(t.fixture.calls.some((call) => call.action === "start")).toBe(false);
-});
-
-it.each(["none", "rejected", "lagging"])(
-  "requires explicit re-add after remote removal, preserving retry identity (%s)",
-  async (failure) => {
-    const rejectReadd = failure === "rejected";
-    const t = await setup("stream", false, true);
-    const action = vi
-      .spyOn(t.fixture.host, "action")
-      .mockRejectedValueOnce(new Error("Missing credentials"));
-    await t.user.click(await t.search());
-    await screen.findByText(/agent did not start/);
-    await t.user.keyboard("{Escape}");
-    await vi.waitFor(() =>
-      expect(screen.queryByRole("dialog")).not.toBeInTheDocument(),
-    );
-    await t.user.click(screen.getByRole("button", { name: "Channel members" }));
-    await screen.findByText(/agent did not start/);
-    await vi.waitFor(() =>
-      expect(screen.queryByText("Loading members…")).not.toBeInTheDocument(),
-    );
-    // Change relay evidence only: the cached roster still contains this agent.
-    t.removeTarget();
-    expect(t.session.channels.list().channels[0]?.members).toContain(
-      t.fixture.agent.pubkey,
-    );
-    await t.user.click(screen.getByRole("button", { name: "Retry" }));
-    await screen.findByText(/Membership changed/);
-    expect(action).toHaveBeenCalledOnce();
-    expect(t.publish).toHaveBeenCalledOnce();
-    expect(t.session.channels.list().channels[0]?.members).not.toContain(
-      t.fixture.agent.pubkey,
-    );
-    expect(
-      screen.queryByRole("button", { name: "Retry" }),
-    ).not.toBeInTheDocument();
-    if (rejectReadd) t.fail("Addition denied");
-    if (failure === "lagging") t.delayRoster();
-    await t.user.click(await t.search());
-    if (rejectReadd) {
-      await screen.findByText(/Addition denied/);
-      t.fail("");
-      await t.user.click(screen.getByRole("button", { name: "Retry" }));
-    }
-    if (failure === "lagging") {
-      await screen.findByText(/Addition is not confirmed/);
-      await t.user.click(screen.getByRole("button", { name: "Retry" }));
-      await screen.findByText(/Addition is not confirmed/);
-      expect(t.publish).toHaveBeenCalledTimes(2);
-      t.confirmRoster();
-      await t.user.click(screen.getByRole("button", { name: "Retry" }));
-    }
-    await vi.waitFor(() =>
-      expect(t.control.snapshot().data?.agents[0]?.status).toBe("running"),
-    );
-    expect(t.publish).toHaveBeenCalledTimes(rejectReadd ? 3 : 2);
-    const ids = t.publish.mock.calls.map(([event]) => event.id);
-    expect(ids[0]).not.toBe(ids[1]);
-    if (rejectReadd) expect(ids[1]).toBe(ids[2]);
-    expect(action).toHaveBeenCalledTimes(2);
-  },
-);
 
 it("keeps known members quiet while rechecking membership without enabling unverified additions", async () => {
   const t = await setup();
@@ -861,7 +745,7 @@ it("shares the identity presentation with invitation rows without assigning a ch
   ).toBeInTheDocument();
   const key = row.querySelector('[aria-hidden="true"].text-mono');
   expect(key).toHaveTextContent(/^npub/);
-  const npub = npubEncode(t.fixture.agent.pubkey);
+  const npub = npubEncode(t.agent.pubkey);
   expect(key).toHaveTextContent(`${npub.slice(0, 11)}…${npub.slice(-6)}`);
   expect(
     within(row).queryByRole("button", { name: /Copy/ }),
@@ -1266,16 +1150,28 @@ async function pagedInvitations(
         : remote
       : query(filters);
   });
+  // The 200 ms search debounce runs on a controlled clock. user-event awaits a
+  // real setTimeout(0) after every action, so these steps drive fireEvent.
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
   const input = screen.getByRole("searchbox");
   const refresh = screen.getByRole("button", { name: "Refresh member data" });
   const idle = () =>
-    step(() =>
-      vi.waitFor(() => expect(refresh).toHaveAttribute("aria-busy", "false")),
-    );
+    step(async () => {
+      await act(() => vi.advanceTimersByTimeAsync(200));
+      await vi.waitFor(() =>
+        expect(refresh).toHaveAttribute("aria-busy", "false"),
+      );
+    });
+  const search = (value: string) =>
+    step(async () => {
+      fireEvent.change(input, { target: { value } });
+    });
+  const click = (button: HTMLElement) =>
+    step(async () => {
+      fireEvent.click(button);
+    });
   const more = () =>
-    step(() =>
-      t.user.click(screen.getByRole("button", { name: "Show more results" })),
-    );
+    click(screen.getByRole("button", { name: "Show more results" }));
   const rows = () =>
     within(
       screen.getByRole("region", { name: "Not in this channel" }),
@@ -1285,16 +1181,16 @@ async function pagedInvitations(
       .flatMap(([filters]) => filters)
       .filter((filter) => filter.search)
       .map((filter) => filter.page);
-  await step(() => t.user.type(input, "Helper"));
+  await search("Helper");
   await idle();
-  return { t, input, refresh, idle, more, rows, pages };
+  return { t, refresh, idle, search, click, more, rows, pages };
 }
 
 it("pages combined local and relay invitations without losing matches", async ({
   signal,
 }) => {
   return ownedTask(signal, async (step) => {
-    const { t, more, rows, pages } = await pagedInvitations(step, 65);
+    const { t, idle, more, rows, pages } = await pagedInvitations(step, 65);
     expect(rows()).toHaveLength(30);
     expect(
       rows().every((row) =>
@@ -1308,9 +1204,8 @@ it("pages combined local and relay invitations without losing matches", async ({
       expect(pages()).toEqual([1]);
     }
     await more();
-    await step(() =>
-      screen.findByRole("button", { name: /^Add Helper final/ }),
-    );
+    await idle();
+    screen.getByRole("button", { name: /^Add Helper final/ });
     expect(rows()).toHaveLength(96);
     expect(pages()).toEqual([1, 2]);
     expect(
@@ -1325,24 +1220,23 @@ it("resets combined invitation paging on refresh or query change", async ({
 }) => {
   return ownedTask(signal, async (step) => {
     // 31 local agents: past one page locally, so a reset is observable.
-    const { t, input, refresh, idle, more, rows, pages } =
+    const { t, refresh, idle, search, click, more, rows, pages } =
       await pagedInvitations(step, 31);
     for (let i = 0; i < 3; i++) await more();
-    await step(() =>
-      screen.findByRole("button", { name: /^Add Helper final/ }),
-    );
+    await idle();
+    screen.getByRole("button", { name: /^Add Helper final/ });
     expect(rows()).toHaveLength(62);
     expect(pages()).toEqual([1, 2]);
-    await step(() => t.user.click(refresh));
+    await click(refresh);
     await idle();
     expect(rows()).toHaveLength(30);
     expect(pages()).toEqual([1, 2, 1]);
     await more();
     expect(rows()).toHaveLength(60);
-    await step(() => t.user.type(input, " local"));
+    await search("Helper local");
     await idle();
     expect(rows()).toHaveLength(30);
-    await step(() => t.user.clear(input));
+    await search("");
     expect(
       screen.queryByRole("region", { name: "Not in this channel" }),
     ).toBeNull();
