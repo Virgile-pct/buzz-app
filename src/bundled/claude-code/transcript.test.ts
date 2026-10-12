@@ -112,6 +112,50 @@ it("groups a session file into prompted turns with steering, tools and replies",
   );
 });
 
+it("shows what the agent posted as its reply, and names Buzz tools as Codex does", () => {
+  clock = 0;
+  const send = (id: string, text: string) =>
+    line("assistant", [
+      { type: "tool_use", id, name: "mcp__buzz__send", input: { text } },
+    ]);
+  const result = (id: string, content: string, is_error = false) =>
+    line("user", [{ type: "tool_result", tool_use_id: id, content, is_error }]);
+  const [turn] = claudeTurns(
+    [
+      line("user", prompt("review it")),
+      line("assistant", [
+        {
+          type: "tool_use",
+          id: "r",
+          name: "mcp__buzz__read",
+          input: { thread: root },
+        },
+      ]),
+      result("r", "3 messages"),
+      send("s1", "Looks good."),
+      result("s1", "sent"),
+      send("s2", "One more thing."),
+      result("s2", "channel not found", true),
+    ].join("\n"),
+    conversation,
+    false,
+  );
+  expect(turn?.items).toEqual([
+    expect.objectContaining({ type: "prompt", text: "review it" }),
+    expect.objectContaining({ type: "tool", title: "buzz.read" }),
+    expect.objectContaining({
+      type: "message",
+      text: "Looks good.",
+      posted: true,
+    }),
+    expect.not.objectContaining({ posted: true }),
+    expect.objectContaining({
+      type: "status",
+      text: "The message above was not posted: channel not found",
+    }),
+  ]);
+});
+
 it("keeps steps before the first loaded prompt as a partial turn", () => {
   clock = 0;
   const [turn] = claudeTurns(

@@ -37,6 +37,27 @@ const STATUS: Record<string, string> = {
   declined: "failed",
 };
 
+/** Codex runs each command through the login shell, as `/bin/zsh -lc '…'`;
+ * the command the model wrote is the quoted part. */
+export function shellCommand(command: string) {
+  const quoted = command.match(/^\S*sh -lc (?:'([\s\S]*)'|"([\s\S]*)")$/);
+  if (!quoted) return command;
+  return quoted[1] !== undefined
+    ? quoted[1].replaceAll(`'"'"'`, "'").replaceAll(`'\\''`, "'")
+    : (quoted[2] ?? "").replace(/\\([\\"$`])/g, "$1");
+}
+
+/** Who sent a Buzz turn input: its event, the first line of a section. */
+function sender(sections: readonly { body: string }[]) {
+  for (const { body } of sections) {
+    try {
+      const pubkey = (JSON.parse(body.split("\n")[0] ?? "") as Json).pubkey;
+      if (typeof pubkey === "string") return pubkey;
+    } catch {}
+  }
+  return undefined;
+}
+
 /** The owner's request inside a Buzz turn input; other framing stays in sections. */
 function request(text: string) {
   const quoted = [...text.matchAll(/^Request: (".*")$/gm)].pop()?.[1];
@@ -51,6 +72,7 @@ function item(
   value: Json,
   at: number,
   steer: boolean,
+  name: Names,
 ): TranscriptItem | undefined {
   const id = str(value.id);
   const tool = (patch: Partial<ToolItem>): ToolItem => ({
@@ -76,17 +98,24 @@ function item(
       const raw = (Array.isArray(value.content) ? value.content : [])
         .map((part: Json) => str(part.text))
         .join("\n");
+      const sections = promptSections(raw);
+      const from = sender(sections);
+      const author = from && name(from);
       return {
         id,
         at,
         type: "prompt",
         text: request(raw),
-        sections: promptSections(raw),
+        ...(author ? { author } : {}),
+        sections,
         steer,
       };
     }
     case "agentMessage":
-      return { id, at, type: "message", text: str(value.text) };
+      // A turn's final answer is often empty: the reply went through send.
+      return str(value.text).trim()
+        ? { id, at, type: "message", text: str(value.text) }
+        : undefined;
     case "reasoning": {
       const text = (Array.isArray(value.summary) ? value.summary : []).join(
         "\n\n",
@@ -97,7 +126,7 @@ function item(
       return { id, at, type: "status", text: str(value.text) };
     case "commandExecution":
       return tool({
-        title: str(value.command),
+        title: shellCommand(str(value.command)),
         kind: "execute",
         output: str(value.aggregatedOutput),
       });
@@ -118,7 +147,15 @@ function item(
         input: display(value.arguments),
         output: display(value.error ?? value.result),
       });
-    case "dynamicToolCall":
+    case "dynamicToolCall": {
+      const args = (value.arguments ?? {}) as Json;
+      if (
+        value.namespace === "buzz" &&
+        value.tool === "send" &&
+        value.success !== false &&
+        str(args.text).trim()
+      )
+        return { id, at, type: "message", text: str(args.text), posted: true };
       return tool({
         title: [value.namespace, value.tool].filter(Boolean).join("."),
         input: display(value.arguments),
@@ -127,6 +164,7 @@ function item(
           .join("\n"),
         ...(value.success === false ? { status: "failed" } : {}),
       });
+    }
     case "webSearch":
       return tool({
         title: "Web search",
@@ -138,10 +176,14 @@ function item(
   }
 }
 
+/** A display name for a pubkey, if known. */
+type Names = (pubkey: string) => string | undefined;
+
 /** Codex turns, oldest first, as transcript turns for one conversation. */
 export function codexTurns(
   turns: readonly Turn[],
   conversation: { channelId: string; root?: string },
+  name: Names = () => undefined,
 ): TranscriptTurn[] {
   return turns.map((turn) => {
     const startedAt = (turn.startedAt ?? 0) * 1000;
@@ -151,6 +193,7 @@ export function codexTurns(
         value,
         startedAt,
         value.type === "userMessage" && prompts++ > 0,
+        name,
       );
       return next ? [next] : [];
     });
@@ -299,6 +342,7 @@ export async function readTranscript(
   spawn: Spawn,
   lookup: Lookup,
   signal: AbortSignal,
+  name?: Names,
 ): Promise<CodexTranscript | undefined> {
   return withServer(spawn, signal, async (rpc) => {
     // The saved thread is the conversation's; a found one by its name.
@@ -323,7 +367,7 @@ export async function readTranscript(
     if (!found) return undefined;
     all.sort((a, b) => (a.startedAt ?? 0) - (b.startedAt ?? 0));
     return {
-      turns: codexTurns(all.slice(-TURN_LIMIT), lookup),
+      turns: codexTurns(all.slice(-TURN_LIMIT), lookup, name),
       unknownThread: 0,
       more: more || all.length > TURN_LIMIT,
       working,

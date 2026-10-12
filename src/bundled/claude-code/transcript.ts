@@ -89,6 +89,11 @@ export function claudeTurns(
 ): TranscriptTurn[] {
   const turns: TranscriptTurn[] = [];
   const tools = new Map<string, ToolItem>();
+  /** Messages posted with send, until their result says whether they went. */
+  const sends = new Map<
+    string,
+    { turn: TranscriptTurn; message: { posted?: boolean } }
+  >();
   let last = 0;
   const turn = (id: string, at: number, partial: boolean) => {
     const current = turns.at(-1);
@@ -139,6 +144,16 @@ export function claudeTurns(
     const current = turns.at(-1) ?? turn(id, at, true);
     last = at;
     for (const result of results) {
+      const sent = sends.get(str(result.tool_use_id));
+      if (sent && result.is_error) {
+        delete sent.message.posted;
+        sent.turn.items.push({
+          id: `${id}:${str(result.tool_use_id)}`,
+          at,
+          type: "status",
+          text: `The message above was not posted: ${text(result.content)}`,
+        });
+      }
       const tool = tools.get(str(result.tool_use_id));
       if (!tool) continue;
       tool.output = text(result.content);
@@ -164,13 +179,26 @@ export function claudeTurns(
       else if (block.type === "tool_use") {
         const name = str(block.name);
         const input = object(block.input) ?? {};
+        if (name === "mcp__buzz__send" && str(input.text).trim()) {
+          const message = {
+            id: key,
+            at,
+            type: "message",
+            text: str(input.text),
+            posted: true,
+          } as const satisfies TranscriptItem;
+          current.items.push(message);
+          sends.set(str(block.id), { turn: current, message });
+          return;
+        }
         const path = str(input.file_path) || str(input.path);
         const tool: ToolItem = {
           id: key,
           at,
           type: "tool",
           toolCallId: str(block.id),
-          title: str(input.command) || name,
+          // MCP tools as Codex names them: buzz.read, not mcp__buzz__read.
+          title: str(input.command) || name.replace(/^mcp__(.+?)__/, "$1."),
           kind: KINDS[name] ?? "other",
           status: "in_progress",
           input: JSON.stringify(input, null, 2),

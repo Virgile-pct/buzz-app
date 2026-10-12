@@ -353,6 +353,15 @@ export class CodexRuntime {
       })
       .sort((a, b) => (b.at ?? 0) - (a.at ?? 0));
   }
+  /** A display name for a pubkey in the agent's community, if known. */
+  name(agentPubkey: string, pubkey: string) {
+    const snapshot = this.relay(agentPubkey)?.snapshot();
+    return snapshot?.status === "ready"
+      ? (snapshot.session.names.resolve(pubkey) ??
+          snapshot.session.profiles.snapshot().get(pubkey)?.name ??
+          undefined)
+      : undefined;
+  }
   /** The agent's latest thread for a conversation that another build of the
    * app started, found by the name the agent gave it. */
   async find(

@@ -155,6 +155,7 @@ export function createTabs(
         spawn,
         { agent: { pubkey: agent.pubkey, name: agent.name }, ...conversation },
         abort.signal,
+        (pubkey) => runtime.name(agent.pubkey, pubkey),
       )
         .then(
           (transcript): Read =>

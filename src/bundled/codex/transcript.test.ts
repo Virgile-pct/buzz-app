@@ -2,11 +2,16 @@ import { expect, it, vi } from "vitest";
 import type { HostProcessOptions } from "../../features/host/service";
 import type { Wire } from "./rpc";
 import { sessionTag } from "./prompt";
-import { codexTurns, findConversation, readTranscript } from "./transcript";
+import {
+  codexTurns,
+  findConversation,
+  readTranscript,
+  shellCommand,
+} from "./transcript";
 
 const root = "c".repeat(64);
 const conversation = { channelId: "channel", root };
-const input = `<context>\n{"channel_id":"channel"}\n</context>\n<buzz-event>\n{"id":"e"}\nRequest: "fix the \\u003ctests\\u003e"\n</buzz-event>`;
+const input = `<context>\n{"channel_id":"channel"}\n</context>\n<buzz-event>\n{"id":"e","pubkey":"sam"}\nRequest: "fix the \\u003ctests\\u003e"\n</buzz-event>`;
 const turn = (patch: Record<string, unknown> = {}) => ({
   id: "turn-1",
   status: "completed",
@@ -23,7 +28,7 @@ const turn = (patch: Record<string, unknown> = {}) => ({
     {
       type: "commandExecution",
       id: "c1",
-      command: "pnpm test",
+      command: "/bin/zsh -lc 'pnpm test'",
       aggregatedOutput: "1 failed",
       status: "failed",
       durationMs: 2000,
@@ -56,12 +61,16 @@ const turn = (patch: Record<string, unknown> = {}) => ({
     },
     { type: "agentMessage", id: "a1", text: "Fixed." },
     { type: "contextCompaction", id: "x1" },
+    // A final answer after the reply went through send.
+    { type: "agentMessage", id: "a2", text: "" },
   ],
   ...patch,
 });
 
 it("shows a Codex turn's request, steering, tools and reply in the shared transcript model", () => {
-  const [mapped] = codexTurns([turn()], conversation);
+  const [mapped] = codexTurns([turn()], conversation, (pubkey) =>
+    pubkey === "sam" ? "Sam" : undefined,
+  );
   expect(mapped).toMatchObject({
     turnId: "turn-1",
     channelId: "channel",
@@ -73,6 +82,7 @@ it("shows a Codex turn's request, steering, tools and reply in the shared transc
     expect.objectContaining({
       type: "prompt",
       text: "fix the <tests>",
+      author: "Sam",
       steer: false,
       sections: [
         expect.objectContaining({ tag: "context" }),
@@ -95,12 +105,7 @@ it("shows a Codex turn's request, steering, tools and reply in the shared transc
       paths: ["a.ts"],
       output: "-a\n+b",
     }),
-    expect.objectContaining({
-      type: "tool",
-      title: "buzz.send",
-      status: "completed",
-      output: "sent",
-    }),
+    expect.objectContaining({ type: "message", text: "Done", posted: true }),
     expect.objectContaining({ type: "message", text: "Fixed." }),
   ]);
   const [channelTurn] = codexTurns(
@@ -116,6 +121,47 @@ it("shows a Codex turn's request, steering, tools and reply in the shared transc
 
 const agent = { pubkey: "a".repeat(64), name: "Sol" };
 const lookup = { agent, channelId: "channel", name: "dev", root };
+
+it("shows the command the model wrote, not the login shell running it", () => {
+  expect(shellCommand("/bin/zsh -lc 'git diff --stat'")).toBe(
+    "git diff --stat",
+  );
+  expect(shellCommand(`/bin/bash -lc 'echo '"'"'hi'"'"''`)).toBe("echo 'hi'");
+  expect(shellCommand(`/bin/zsh -lc "sed -n '1,9p' a | grep \\"\\$x\\""`)).toBe(
+    `sed -n '1,9p' a | grep "$x"`,
+  );
+  expect(shellCommand("pnpm test")).toBe("pnpm test");
+});
+
+it("keeps a send that failed as a failed tool call", () => {
+  const [mapped] = codexTurns(
+    [
+      turn({
+        items: [
+          {
+            type: "dynamicToolCall",
+            id: "d1",
+            namespace: "buzz",
+            tool: "send",
+            arguments: { text: "Done" },
+            status: "completed",
+            contentItems: [{ type: "inputText", text: "channel not found" }],
+            success: false,
+          },
+        ],
+      }),
+    ],
+    conversation,
+  );
+  expect(mapped?.items).toEqual([
+    expect.objectContaining({
+      type: "tool",
+      title: "buzz.send",
+      status: "failed",
+      output: "channel not found",
+    }),
+  ]);
+});
 
 /** An app-server answering `thread/turns/list` as the test says, and
  * `thread/list` from `threads` as Codex searches names. */
