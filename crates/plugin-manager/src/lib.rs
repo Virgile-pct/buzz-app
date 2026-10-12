@@ -313,18 +313,19 @@ pub fn bundled_manifests() -> Vec<Manifest> {
                 ],
                 _ => continue,
             };
-            manifest.host = Some(HostGrants {
-                federated_identity: Some(FederatedIdentityGrant {
-                    authority: authority.into(),
-                    operations: routes
-                        .iter()
-                        .map(|route| AuthenticatedOperation {
-                            method: "POST".into(),
-                            path: format!("{base}{route}"),
-                        })
-                        .collect(),
-                }),
-                ..HostGrants::default()
+            let host = manifest.host.get_or_insert_with(HostGrants::default);
+            // FI API access replaces these bundles' renderer network access.
+            // Preserve unrelated command/process grants on the same manifest.
+            host.network_origins.clear();
+            host.federated_identity = Some(FederatedIdentityGrant {
+                authority: authority.into(),
+                operations: routes
+                    .iter()
+                    .map(|route| AuthenticatedOperation {
+                        method: "POST".into(),
+                        path: format!("{base}{route}"),
+                    })
+                    .collect(),
             });
         }
     }
