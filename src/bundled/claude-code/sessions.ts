@@ -1,8 +1,9 @@
 // One agent's Claude sessions: one per conversation (a thread, or a whole DM),
 // each continuing across messages and app restarts. A conversation in use keeps
 // its process; a quiet one is stopped and resumed from its saved session when it
-// is next addressed. One spare process, shared by every agent, waits for the
-// next new conversation, so that starts without a spawn.
+// is next addressed, or sooner when the agent is at its process limit and
+// another conversation starts. One spare process, shared by every agent, waits
+// for the next new conversation, so that starts without a spawn.
 import {
   ClaudeProcess,
   type ClaudeLaunch,
@@ -13,6 +14,10 @@ import {
   type TurnPick,
 } from "./claude";
 
+/** Processes an agent keeps for its conversations. The host allows 64 across
+ * every plugin, and frees a slot only after a stopped process has exited; the
+ * shared spare is not counted, as it is not any agent's. */
+export const MAX_LIVE = 6;
 /** A conversation's process stops after this long without a message. */
 export const IDLE_MS = 15 * 60_000;
 /** Saved sessions per agent; the least recently used are forgotten. */
@@ -183,6 +188,12 @@ export class AgentSessions {
       return this.answer(key, live, live.process.busy ? steer : text, pick);
     }
     const saved = this.options.store.get(key);
+    // Any start needs room, reserved here, before anything is awaited.
+    if (!this.room())
+      return {
+        ok: false,
+        error: `Claude Code is already working in ${MAX_LIVE} conversations; try again when one finishes`,
+      };
     const starting = this.start(saved?.id).catch((error) => {
       console.warn("Claude Code could not start", error);
       return undefined;
@@ -285,6 +296,23 @@ export class AgentSessions {
       seen: Math.max(seen ?? 0, prior?.id === id ? prior.seen : 0),
       at: live.used,
     });
+  }
+  /** Processes running or starting. */
+  private count() {
+    return this.live.size + this.opening.size;
+  }
+  /** Makes room for one more process by stopping the longest-idle
+   * conversation; it resumes from its saved session when next addressed.
+   * False when every process is working. */
+  private room() {
+    while (this.count() >= MAX_LIVE) {
+      const idle = [...this.live]
+        .filter(([, live]) => !live.process.busy)
+        .sort(([, a], [, b]) => a.used - b.used)[0];
+      if (!idle) return false;
+      this.drop(...idle);
+    }
+    return true;
   }
   private drop(key: string, live: Live) {
     clearTimeout(live.timer);
