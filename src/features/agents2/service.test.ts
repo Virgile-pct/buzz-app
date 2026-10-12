@@ -1,11 +1,20 @@
+import { createHash } from "node:crypto";
 import { Context } from "@deepseek-ai/cordis";
+import { schnorr } from "@noble/curves/secp256k1.js";
+import { bytesToHex } from "nostr-tools/utils";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import type { RelayEvent } from "../relay/events";
 import type { LiveBatch, LiveListener } from "../relay/incoming";
 import type { RelayData, RelaySnapshot } from "../relay/service";
 import type { RelaySession } from "../relay/session";
-import type { AgentIdentity, AgentsNative } from "./native";
-import { Agents2Service, type AgentType, type Delivery } from "./service";
+import type { AgentEventTemplate, AgentIdentity, AgentsNative } from "./native";
+import {
+  Agents2Service,
+  type AgentCommunities,
+  type AgentType,
+  type Delivery,
+  fromOwner,
+} from "./service";
 import { memoryStorage } from "./test-fakes";
 
 // Cleanup's channel step has its own coverage (relay-removal); here only its
@@ -33,7 +42,7 @@ const event = (id: string, patch: Partial<RelayEvent> = {}) =>
     ...patch,
   }) as unknown as RelayEvent;
 
-function fakeRelay() {
+function fakeRelay(origin = "https://relay.example.test") {
   const live = new Set<LiveListener>();
   const changes = new Set<() => void>();
   const archived = new Set<string>();
@@ -60,6 +69,8 @@ function fakeRelay() {
   const statuses = new Set<() => void>();
   const session = {
     archives,
+    // STOPGAP(agent-local-typing): delete with local-typing.ts.
+    typing: { local: vi.fn() },
     live: {
       snapshot: () => ({ status }),
       subscribe(listener: () => void) {
@@ -76,8 +87,8 @@ function fakeRelay() {
     status: "ready",
     generation: 1,
     viewer,
-    origin: "https://relay.example.test",
-    scope: `https://relay.example.test:${viewer}`,
+    origin,
+    scope: `${origin}:${viewer}`,
     session,
   };
   const connected_ = snapshot;
@@ -88,12 +99,23 @@ function fakeRelay() {
         changes.add(listener);
         return () => changes.delete(listener);
       },
+      retry: vi.fn(),
     } as unknown as RelayData,
     /** Drops the connection, or restores it with a new session. */
     connect(connected: boolean) {
       snapshot = connected
         ? { ...connected_, session: { ...session } as RelaySession }
         : { status: "disconnected", generation: 2, session };
+      for (const listener of changes) listener();
+    },
+    /** Fails the connection, as a first connect that timed out does. */
+    fail() {
+      snapshot = { status: "error", generation: 4, session, error: "down" };
+      for (const listener of changes) listener();
+    },
+    /** Replaces the session, as after the transport was lost. */
+    reconnecting() {
+      snapshot = { status: "connecting", generation: 3, session };
       for (const listener of changes) listener();
     },
     /** Drops and restores the socket inside the same session, as live.ts does. */
@@ -107,6 +129,39 @@ function fakeRelay() {
       for (const listener of live) listener(batch);
     },
     archives,
+    origin,
+  };
+}
+
+/** The viewer's joined communities, one selected; `open` connects any of them. */
+function fakeCommunities(...joined: ReturnType<typeof fakeRelay>[]) {
+  let relays = joined;
+  const changes = new Set<() => void>();
+  let selected: string | null = relays[0]?.origin ?? null;
+  return {
+    communities: {
+      snapshot: () => ({
+        viewer,
+        selected,
+        memberships: relays.map(({ origin }) => ({ id: origin, name: origin })),
+      }),
+      subscribe: (listener: () => void) => {
+        changes.add(listener);
+        return () => changes.delete(listener);
+      },
+      open: vi.fn(
+        (id: string) => relays.find((fake) => fake.origin === id)?.relay,
+      ),
+    } as unknown as AgentCommunities,
+    select(next: string | null) {
+      selected = next;
+      for (const listener of changes) listener();
+    },
+    leave(origin: string) {
+      relays = relays.filter((fake) => fake.origin !== origin);
+      if (selected === origin) selected = null;
+      for (const listener of changes) listener();
+    },
   };
 }
 
@@ -134,8 +189,45 @@ function fakeNative(identities: AgentIdentity[] = []) {
       identities.push(identity);
       return identity;
     }),
+    portable: vi.fn(async () => ({
+      agents: [
+        { source: "harness" as const, pubkey: bot, name: "Old", relay: "" },
+        {
+          source: "installed" as const,
+          pubkey: sibling,
+          name: "Older",
+          relay: "",
+        },
+      ],
+      warnings: ["Could not read one store"],
+    })),
+    port: vi.fn(
+      async (
+        _: string,
+        pubkey: string,
+        __: string,
+        ___: string,
+        type: string,
+      ) => {
+        const identity = {
+          pubkey,
+          relay: "wss://relay.example.test",
+          owner: viewer,
+          type,
+          name: "Older",
+          deleted: false,
+        };
+        identities.push(identity);
+        return identity;
+      },
+    ),
     rename: vi.fn(async (pubkey: string, name: string) => {
       change(pubkey, { name });
+    }),
+    setPicture: vi.fn(async (pubkey: string, picture: string | null) => {
+      const index = at(pubkey);
+      const { picture: _, ...identity } = identities[index] as AgentIdentity;
+      identities[index] = picture ? { ...identity, picture } : identity;
     }),
     remove: vi.fn(async (pubkey: string) => {
       steps.push("key");
@@ -145,8 +237,13 @@ function fakeNative(identities: AgentIdentity[] = []) {
       steps.push("forget");
       identities.splice(at(pubkey), 1);
     }),
-    publish: vi.fn(async (pubkey: string, template: { kind: number }) =>
-      event(`p${++published}`, { pubkey, kind: template.kind }),
+    publish: vi.fn(async (pubkey: string, template: AgentEventTemplate) =>
+      event(`p${++published}`, {
+        pubkey,
+        kind: template.kind,
+        content: template.content,
+        tags: (template.tags ?? []).map((tag) => [...tag]),
+      }),
     ),
     publishProfile: vi.fn(async (_: string) => {}),
     query: vi.fn(async () => []),
@@ -171,8 +268,10 @@ async function setup({
     subscribe: () => () => {},
   });
   const fake = fakeRelay();
+  const second = fakeRelay("https://other.example.test");
+  const client = fakeCommunities(fake, second);
   const native = fakeNative(identities);
-  const service = new Agents2Service(ctx, fake.relay, native, storage);
+  const service = new Agents2Service(ctx, client.communities, native, storage);
   const plugin = ctx.extend({
     pluginOwner: Object.freeze({ id: "example", revision: "one" }),
   });
@@ -195,6 +294,20 @@ async function setup({
         },
       },
     }),
+    models: async () => ({
+      current: "fast",
+      models: [
+        {
+          id: "fast",
+          label: "Fast",
+          efforts: [
+            { id: "low", label: "Low" },
+            { id: "high", label: "High" },
+          ],
+        },
+        { id: "deep", label: "Deep", efforts: [{ id: "max", label: "Max" }] },
+      ],
+    }),
     run,
   };
   plugin.agents2.register(type);
@@ -206,8 +319,15 @@ async function setup({
     run,
     emit: fake.emit,
     connect: fake.connect,
+    fail: fake.fail,
+    relay: fake.relay,
+    reconnecting: fake.reconnecting,
     recover: fake.recover,
     archives: fake.archives,
+    second,
+    select: client.select,
+    leave: client.leave,
+    communities: client.communities,
     ctx,
   };
 }
@@ -215,6 +335,14 @@ async function setup({
 /** Lets every pending promise chain finish: a macrotask runs only after the
  * microtask queue is empty, so this does not depend on how fast runners are. */
 const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+/** The events native published as an agent, of `kind`, in order. */
+async function published(native: ReturnType<typeof fakeNative>, kind: number) {
+  const events = await Promise.all(
+    native.publish.mock.results.map(({ value }) => value),
+  );
+  return events.filter((event) => event.kind === kind);
+}
 
 beforeEach(() => {
   vi.useRealTimers();
@@ -247,6 +375,40 @@ it("creates an agent in the community shown, with its type's defaults, and publi
   expect(service.find(bot)).toEqual(agent);
 });
 
+it("brings over an identity not already an agent, with its type's defaults, and publishes its profile", async () => {
+  const { service, native } = await setup();
+  await service.create({ type: "example/echo", name: "Echo" });
+  const found = await service.portable();
+  // `bot` is already an agent here; the warning still shows.
+  expect(found.agents.map((agent) => agent.pubkey)).toEqual([sibling]);
+  expect(found.warnings).toEqual(["Could not read one store"]);
+  const agent = await service.port({
+    source: "installed",
+    pubkey: sibling,
+    type: "example/echo",
+  });
+  expect(native.port).toHaveBeenCalledWith(
+    "installed",
+    sibling,
+    "https://relay.example.test",
+    viewer,
+    "example/echo",
+  );
+  expect(native.publishProfile).toHaveBeenCalledWith(sibling);
+  expect(agent).toMatchObject({
+    pubkey: sibling,
+    name: "Older",
+    config: { reply: "ok" },
+  });
+  expect(Object.keys(agent.attention)).toEqual([
+    "interest/default",
+    "watch/channel",
+  ]);
+  await expect(
+    service.port({ source: "harness", pubkey: bot, type: "nope/none" }),
+  ).rejects.toThrow("That agent type is not available");
+});
+
 it("delivers mentions and matching watches once, and never the agent's own events", async () => {
   const { service, run, emit } = await setup();
   await service.create({ type: "example/echo", name: "Echo" });
@@ -272,6 +434,71 @@ it("delivers mentions and matching watches once, and never the agent's own event
   expect(first?.config).toEqual({ reply: "ok" });
 });
 
+// STOPGAP(agent-working-reactions): delete with working-reactions.ts.
+it("reacts 👀 and 💬 to a mention until the work its run handed off settles", async () => {
+  const { service, run, emit, native, relay } = await setup();
+  await service.create({ type: "example/echo", name: "Echo" });
+  let finish = () => {};
+  const turn = new Promise<void>((resolve) => {
+    finish = resolve;
+  });
+  run.mockImplementationOnce(async ({ workingUntil }) => workingUntil(turn));
+  const mention = event("m", {
+    tags: [
+      ["h", channel],
+      ["p", bot],
+    ],
+  });
+  emit({ events: [mention], channelId: channel });
+  await vi.waitFor(() => expect(run).toHaveBeenCalledTimes(1));
+  await settle();
+  const reactions = await published(native, 7);
+  expect(reactions.map(({ content, tags }) => [content, tags])).toEqual(
+    ["👀", "💬"].map((emoji) => [
+      emoji,
+      [
+        ["h", channel],
+        ["e", mention.id],
+      ],
+    ]),
+  );
+  // STOPGAP(agent-local-typing): this device shows the agent typing in the
+  // mention's thread meanwhile.
+  expect(relay.snapshot().session.typing.local).toHaveBeenCalledWith(
+    expect.objectContaining({
+      pubkey: bot,
+      kind: 20002,
+      tags: [
+        ["h", channel],
+        ["e", mention.id, "", "reply"],
+      ],
+    }),
+  );
+  // `run` has returned, but the turn it handed off is still going.
+  expect(await published(native, 5)).toEqual([]);
+  finish();
+  await vi.waitFor(async () =>
+    expect(await published(native, 5)).toHaveLength(2),
+  );
+  // The relay takes one target per deletion.
+  expect((await published(native, 5)).map(({ tags }) => tags)).toEqual(
+    reactions.map(({ id }) => [
+      ["h", channel],
+      ["e", id],
+      ["k", "7"],
+    ]),
+  );
+  // Only mentions are reacted to, and a failed run takes its reactions back.
+  run.mockRejectedValueOnce(new Error("boom"));
+  emit({ events: [event("m2", { tags: mention.tags })], channelId: channel });
+  emit({ events: [event("w", { content: "deploy" })], channelId: channel });
+  await vi.waitFor(() => expect(run).toHaveBeenCalledTimes(3));
+  await vi.waitFor(async () =>
+    expect(await published(native, 5)).toHaveLength(4),
+  );
+  expect(await published(native, 7)).toHaveLength(4);
+});
+
 it("treats a reply to something the agent published as addressed", async () => {
   const { service, run, emit } = await setup();
   await service.create({ type: "example/echo", name: "Echo" });
@@ -284,6 +511,37 @@ it("treats a reply to something the agent published as addressed", async () => {
   emit({ events: [event("r", { tags: [["e", "p1".padEnd(64, "0")]] })] });
   await vi.waitFor(() => expect(run).toHaveBeenCalledTimes(2));
   expect(run.mock.calls[1]?.[0].trigger.type).toBe("mention");
+});
+
+it("passes the model and effort its owner asked for, and no other", async () => {
+  const { service, run, emit } = await setup();
+  await service.create({ type: "example/echo", name: "Echo" });
+  const asked = (id: string, pubkey: string, ...tags: string[][]) =>
+    event(id, { pubkey, tags: [["h", channel], ["p", bot], ...tags] });
+  emit({
+    events: [
+      asked("owner", viewer, ["effort", bot, "high"]),
+      asked("stranger", other, ["effort", bot, "high"], ["model", bot, "deep"]),
+      asked("unlisted", viewer, ["effort", bot, "max"]),
+      asked("elsewhere", viewer, ["effort", sibling, "high"]),
+      asked("model", viewer, ["model", bot, "deep"], ["effort", bot, "max"]),
+      asked("mismatch", viewer, ["model", bot, "deep"], ["effort", bot, "low"]),
+      asked("unknown", viewer, ["model", bot, "gone"], ["effort", bot, "low"]),
+    ],
+  });
+  await vi.waitFor(() => expect(run).toHaveBeenCalledTimes(7));
+  expect(
+    run.mock.calls.map(([{ model, effort }]) => ({ model, effort })),
+  ).toEqual([
+    { model: undefined, effort: "high" },
+    { model: undefined, effort: undefined },
+    { model: undefined, effort: undefined },
+    { model: undefined, effort: undefined },
+    // An effort counts only for the model the run uses.
+    { model: "deep", effort: "max" },
+    { model: "deep", effort: undefined },
+    { model: undefined, effort: "low" },
+  ]);
 });
 
 it("keeps the in-flight run and the queue across edits; each job reads the agent as it starts", async () => {
@@ -424,6 +682,121 @@ it("claims an agent as it comes into view, and releases it as it leaves, without
   await vi.waitFor(() => expect(native.claim).toHaveBeenCalledWith(bot));
 });
 
+it("keeps running an agent while another community is selected, and gives it only its community's events", async () => {
+  const { service, run, emit, second, select } = await setup();
+  await service.create({ type: "example/echo", name: "Echo" });
+  select(second.origin);
+  expect(service.find(bot)).toBeUndefined();
+  expect(service.snapshot().running.map((agent) => agent.pubkey)).toEqual([
+    bot,
+  ]);
+  expect(service.relay(bot)?.snapshot().origin).toBe(
+    "https://relay.example.test",
+  );
+  second.emit({ events: [event("2", { tags: [["p", bot]] })] });
+  const mention = event("1", { tags: [["p", bot]] });
+  emit({ events: [mention] });
+  await vi.waitFor(() => expect(run).toHaveBeenCalledTimes(1));
+  expect(run.mock.calls[0]?.[0].trigger).toEqual({
+    type: "mention",
+    event: mention,
+  });
+  await settle();
+  expect(run).toHaveBeenCalledTimes(1);
+});
+
+it("connects an agent's community at start without selecting it", async () => {
+  const { service, run, second, communities } = await setup({
+    identities: [
+      {
+        pubkey: bot,
+        relay: "wss://other.example.test",
+        owner: viewer,
+        type: "example/echo",
+        name: "Echo",
+        deleted: false,
+      },
+    ],
+  });
+  expect(communities.open).toHaveBeenCalledWith("https://other.example.test");
+  expect(service.find(bot)).toBeUndefined();
+  second.emit({ events: [event("1", { tags: [["p", bot]] })] });
+  await vi.waitFor(() => expect(run).toHaveBeenCalledTimes(1));
+});
+
+it("opens no community for an agent list that arrives after it stopped", async () => {
+  const ctx = new Context();
+  ctx.provide("pluginStatus", {
+    isActive: () => true,
+    subscribe: () => () => {},
+  });
+  const client = fakeCommunities(
+    fakeRelay(),
+    fakeRelay("https://other.example.test"),
+  );
+  client.select(null);
+  const native = fakeNative();
+  let list!: (identities: AgentIdentity[]) => void;
+  native.list.mockReturnValueOnce(
+    new Promise((resolve) => {
+      list = resolve;
+    }),
+  );
+  const service = new Agents2Service(
+    ctx,
+    client.communities,
+    native,
+    memoryStorage(),
+  );
+  await vi.waitFor(() => expect(list).toBeDefined());
+  await ctx.fiber.dispose();
+  list([
+    {
+      pubkey: bot,
+      relay: "wss://other.example.test",
+      owner: viewer,
+      type: "example/echo",
+      name: "Echo",
+      deleted: false,
+    },
+  ]);
+  await settle();
+  expect(client.communities.open).not.toHaveBeenCalled();
+  expect(service.snapshot().running).toEqual([]);
+});
+
+it("keeps an agent running while its community reconnects, and stops it on disconnect or leave", async () => {
+  const { service, connect, reconnecting, leave } = await setup();
+  await service.create({ type: "example/echo", name: "Echo" });
+  const running = () => service.snapshot().running.map((agent) => agent.pubkey);
+  reconnecting();
+  expect(service.find(bot)).toBeUndefined();
+  expect(running()).toEqual([bot]);
+  connect(false);
+  expect(running()).toEqual([]);
+  connect(true);
+  expect(running()).toEqual([bot]);
+  leave("https://relay.example.test");
+  expect(running()).toEqual([]);
+  expect(service.relay(bot)).toBeUndefined();
+});
+
+it("tries a failed unselected community again every so often, and leaves the selected one's Retry to the viewer", async () => {
+  vi.useFakeTimers();
+  const { service, relay, fail, second, select } = await setup();
+  await service.create({ type: "example/echo", name: "Echo" });
+  fail();
+  await vi.advanceTimersByTimeAsync(10_000);
+  expect(relay.retry).not.toHaveBeenCalled();
+  select(second.origin);
+  await vi.advanceTimersByTimeAsync(5_000);
+  expect(relay.retry).toHaveBeenCalledTimes(1);
+  await vi.advanceTimersByTimeAsync(20_000);
+  expect(relay.retry).toHaveBeenCalledTimes(1);
+  await vi.advanceTimersByTimeAsync(10_000);
+  expect(relay.retry).toHaveBeenCalledTimes(2);
+});
+
 it("is not woken by reactions, deletions or DMs", async () => {
   const { service, run, emit } = await setup();
   await service.create({ type: "example/echo", name: "Echo" });
@@ -446,53 +819,98 @@ it("is not woken by reactions, deletions or DMs", async () => {
   expect(run.mock.calls[0]?.[0].trigger).toMatchObject({ type: "mention" });
 });
 
-it("does not let one owner's agents wake each other by replying", async () => {
-  const { service, run, emit } = await setup();
+it("wakes on another of the owner's agents only when it names the agent", async () => {
+  const { service, run, emit, native } = await setup();
   await service.create({ type: "example/echo", name: "Echo" });
   await service.create({ type: "example/echo", name: "Sibling" });
   run.mockImplementation(async ({ agent, trigger }) => {
     if (trigger.type === "timer") return;
     await agent.publish({ kind: 9, content: "hi" });
   });
-  const start = event("start", {
-    tags: [
-      ["h", channel],
-      ["p", bot],
+  emit({
+    events: [
+      event("start", {
+        tags: [
+          ["h", channel],
+          ["p", bot],
+        ],
+      }),
     ],
   });
-  emit({ events: [start] });
   await vi.waitFor(() => expect(run).toHaveBeenCalledTimes(1));
-  // The sibling replies to Echo's message, naming it, and also says "deploy",
-  // which Echo's watch matches. Neither wakes Echo.
-  const echoMessage = "p1".padEnd(64, "0");
+  const echoMessage = (await published(native, 9))[0]?.id;
+  const auth = ["auth", viewer, "", "f".repeat(128)];
+  // The sibling replies to Echo's message without naming it, and says "deploy",
+  // which Echo's watch matches. Neither wakes Echo: two agents replying to each
+  // other would otherwise never stop.
   emit({
     events: [
       event("reply", {
         pubkey: sibling,
         content: "deploy",
-        tags: [
-          ["h", channel],
-          ["e", echoMessage],
-          ["p", bot],
-        ],
+        tags: [["h", channel], ["e", echoMessage], auth],
       }),
     ],
   });
   await settle();
   expect(run).toHaveBeenCalledTimes(1);
-  // A fresh mention from the sibling still does.
+  // Naming Echo wakes it, even in reply to Echo's own message.
   emit({
     events: [
-      event("ask", {
+      event("callback", {
         pubkey: sibling,
-        tags: [
-          ["h", channel],
-          ["p", bot],
-        ],
+        tags: [["h", channel], ["e", echoMessage], ["p", bot], auth],
       }),
     ],
   });
   await vi.waitFor(() => expect(run).toHaveBeenCalledTimes(2));
+  expect(run.mock.calls[1]?.[0].trigger).toMatchObject({
+    type: "mention",
+    event: { pubkey: sibling },
+  });
+});
+
+it("answers the owner and agents the owner attested, nobody else", async () => {
+  const secret = schnorr.utils.randomSecretKey();
+  const owner = bytesToHex(schnorr.getPublicKey(secret));
+  const agent = bytesToHex(
+    schnorr.getPublicKey(schnorr.utils.randomSecretKey()),
+  );
+  const digest = createHash("sha256")
+    .update(`nostr:agent-auth:${agent}:`)
+    .digest();
+  const auth = ["auth", owner, "", bytesToHex(schnorr.sign(digest, secret))];
+  const from = (pubkey: string, tags: string[][] = []) => ({
+    pubkey,
+    kind: 9,
+    created_at: 100,
+    tags,
+  });
+  expect(await fromOwner(from(owner), owner)).toBe(true);
+  expect(await fromOwner(from(agent, [auth]), owner)).toBe(true);
+  expect(await fromOwner(from(agent), owner)).toBe(false);
+  // Another key cannot borrow the agent's attestation, nor claim an owner.
+  expect(await fromOwner(from(other, [auth]), owner)).toBe(false);
+  expect(
+    await fromOwner(from(agent, [["auth", owner, "", "0".repeat(128)]]), owner),
+  ).toBe(false);
+});
+
+it("sets and clears a picture through native, and publishes it", async () => {
+  const { service, native } = await setup();
+  await service.create({ type: "example/echo", name: "Echo" });
+  native.publishProfile.mockClear();
+  const url = "https://relay.example/media/abc";
+  await service.save(bot, { picture: url });
+  expect(native.setPicture).toHaveBeenCalledWith(bot, url);
+  expect(service.find(bot)?.picture).toBe(url);
+  expect(native.publishProfile).toHaveBeenCalledWith(bot);
+  // An unchanged picture is not saved again; an empty one clears it.
+  await service.save(bot, { picture: url });
+  expect(native.setPicture).toHaveBeenCalledOnce();
+  await service.save(bot, { picture: "" });
+  expect(native.setPicture).toHaveBeenLastCalledWith(bot, null);
+  expect(service.find(bot)?.picture).toBeUndefined();
 });
 
 it("renames through native, and publishes profiles again on rename and reconnect", async () => {
@@ -639,7 +1057,12 @@ it("keeps an agent created while identities are still loading", async () => {
   native.list.mockImplementationOnce(
     () => new Promise<AgentIdentity[]>((resolve) => (release = resolve)),
   );
-  const service = new Agents2Service(ctx, fakeRelay().relay, native, storage);
+  const service = new Agents2Service(
+    ctx,
+    fakeCommunities(fakeRelay()).communities,
+    native,
+    storage,
+  );
   ctx
     .extend({ pluginOwner: Object.freeze({ id: "example", revision: "one" }) })
     .agents2.register<Config>({

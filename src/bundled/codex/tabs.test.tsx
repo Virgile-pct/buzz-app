@@ -109,7 +109,7 @@ function fixture(
     getItem: () => JSON.stringify(saved),
     setItem: () => undefined,
   } as unknown as Storage;
-  const runtime = new CodexRuntime(spawn, relay, storage);
+  const runtime = new CodexRuntime(spawn, () => relay, storage);
   const tabs = createTabs(React, spawn, runtime);
   const props = (settings = defaults, save = vi.fn(async () => {})) =>
     ({

@@ -115,12 +115,12 @@ function applied({
   const ctx = {
     pluginOwner: { id: "buzz.claude-code", revision: "r1" },
     host: { spawn, request: vi.fn() },
-    relay: { snapshot: () => ({ status: "signed-out" }) },
     agents2: {
       register: (registered: AgentType<Config>) => {
         type = registered;
       },
-      snapshot: () => ({ status: "ready", agents: [] }),
+      snapshot: () => ({ status: "ready", agents: [], running: [] }),
+      relay: () => undefined,
       subscribe: () => () => undefined,
     },
     effect: vi.fn(),
@@ -145,7 +145,7 @@ async function choose(label: string, option: string) {
 }
 
 it("is an agent type on the desktop app", () => {
-  expect(inject).toEqual(["agents2", "host", "relay"]);
+  expect(inject).toEqual(["agents2", "host"]);
   const { type } = installed();
   expect(type).toMatchObject({ id: "claude-code", title: "Claude Code" });
   expect(type.defaults()).toEqual({ config: DEFAULT_CONFIG });
@@ -197,7 +197,7 @@ it("keeps focus on sign-in while it runs and on the same button after cancel", a
   expect(cancel).not.toHaveAttribute("disabled");
 });
 
-it("saves settings as one config and warns before answering anyone", async () => {
+it("saves settings as one config", async () => {
   const Settings = tab(installed().type, 1);
   const save = vi.fn(async () => undefined);
   render(<Settings agent={agent()} save={save} />);
@@ -207,8 +207,6 @@ it("saves settings as one config and warns before answering anyone", async () =>
     "true",
   );
   await choose("Model", "Sonnet");
-  await choose("Answers", "Anyone who mentions it");
-  expect(screen.getByText(/with no approval step/)).toBeVisible();
   expect(screen.getByLabelText("Workspace")).toHaveAccessibleDescription(
     "The folder Claude Code works in. Use ~/ for your home folder.",
   );
@@ -217,7 +215,6 @@ it("saves settings as one config and warns before answering anyone", async () =>
   expect(save).toHaveBeenCalledWith({
     ...DEFAULT_CONFIG,
     model: "sonnet",
-    respondTo: "anyone",
     workspace: "~/.buzz",
   });
 });
