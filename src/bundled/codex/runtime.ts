@@ -56,6 +56,9 @@ type Active = {
   steering: Promise<void>;
   reply: Request;
   finished: boolean;
+  /** What the turn runs on, once resolved; a differing pick queues a turn. */
+  model?: string;
+  effort?: string;
   workspace: string;
   signal: AbortSignal;
   version: number;
@@ -376,7 +379,13 @@ export class CodexRuntime {
         try {
           await active.ready;
           if (entry.abort.signal.aborted) return;
-          if (active.finished) {
+          // Steering cannot carry a model or effort, so a differing pick
+          // waits for this turn and runs as the next one.
+          if (
+            active.finished ||
+            (request.model && request.model !== active.model) ||
+            (request.effort && request.effort !== active.effort)
+          ) {
             this.start(request, text, key, lane, entry);
             return;
           }
@@ -688,6 +697,8 @@ export class CodexRuntime {
         [request.effort, settings.effort].find(
           (level) => level && supported.includes(level),
         ) ?? selected.defaultReasoningEffort;
+      active.model = model;
+      active.effort = effort;
       const mcp = Object.fromEntries(
         Object.entries(normalized.config.mcp_servers ?? {}).map(
           ([name, server]) => [
