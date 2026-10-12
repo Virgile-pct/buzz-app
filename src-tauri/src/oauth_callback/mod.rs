@@ -2,7 +2,10 @@
 //! RFC 8252 §§7.3, 8.3, 8.4, 8.9; RFC 6749 §§4.1.2, 4.1.2.1; RFC 9700 §2.1.
 //! See this folder's README.md for the command contract, ownership, and limits.
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-use std::{sync::Mutex, time::Duration};
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 use tauri_plugin_opener::OpenerExt;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -33,14 +36,15 @@ struct Attempt {
     id: String,
     result: Option<oneshot::Receiver<CallbackResult>>,
     task: JoinHandle<()>,
+    retain_result: bool,
 }
 impl Drop for Attempt {
     fn drop(&mut self) {
         self.task.abort();
     }
 }
-#[derive(Default)]
-pub(crate) struct OAuthCallbackHost(Mutex<Option<Attempt>>);
+#[derive(Clone, Default)]
+pub(crate) struct OAuthCallbackHost(Arc<Mutex<Option<Attempt>>>);
 
 impl OAuthCallbackHost {
     pub(crate) fn document_load(
@@ -115,7 +119,10 @@ impl OAuthCallbackHost {
             return Err("Invalid callback path".into());
         }
         let mut current = self.0.lock().map_err(|_| "Sign-in unavailable")?;
-        if current.is_some() {
+        if current
+            .as_ref()
+            .is_some_and(|attempt| attempt.retain_result || !attempt.task.is_finished())
+        {
             return Err("An OAuth callback is already pending".into());
         }
         // Binding is synchronous so cancellation cannot overtake listener registration.
@@ -160,6 +167,9 @@ impl OAuthCallbackHost {
             id: id.clone(),
             result: Some(receive),
             task,
+            // A native FI login retains its completed handoff until wait/cancel.
+            // Generic OAuth keeps its existing finished-task replacement rule.
+            retain_result: callback_parameter == "return_to",
         });
         drop(current);
         if open(authorization.as_str()).is_err() {
