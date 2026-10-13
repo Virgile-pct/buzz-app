@@ -39,9 +39,9 @@ case "$host" in
   *-windows-msvc)
     exe=.exe
     # Under Git Bash, `perl` is MSYS's, which cannot configure the vendored
-    # OpenSSL: openssl-src takes a native Perl from OPENSSL_SRC_PERL instead.
-    if [ -z "${OPENSSL_SRC_PERL:-}" ] && perl -e 'exit($^O eq "msys" ? 0 : 1)' 2>/dev/null; then
-      echo "The vendored OpenSSL needs a native Windows Perl (for example Strawberry Perl): set OPENSSL_SRC_PERL to its perl.exe." >&2
+    # OpenSSL: openssl-src takes a native Perl from OPENSSL_SRC_PERL or PERL instead.
+    if [ -z "${OPENSSL_SRC_PERL:-}${PERL:-}" ] && perl -e 'exit($^O eq "msys" ? 0 : 1)' 2>/dev/null; then
+      echo "The vendored OpenSSL needs a native Windows Perl (for example Strawberry Perl): set OPENSSL_SRC_PERL or PERL to its perl.exe." >&2
       exit 1
     fi
     # In a Visual Studio developer environment rustc trusts PATH, where Git
