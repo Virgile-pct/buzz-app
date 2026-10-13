@@ -33,11 +33,33 @@ else
   git -C "$work/src" fetch -q --depth 1 --filter=blob:none "$REPOSITORY" "$REVISION"
   git -C "$work/src" checkout -q --detach FETCH_HEAD
 fi
+host=$(rustc -vV | sed -n 's/^host: //p')
+exe=
+case "$host" in
+  *-windows-msvc)
+    exe=.exe
+    # Under Git Bash, `perl` is MSYS's, which cannot configure the vendored
+    # OpenSSL: openssl-src takes a native Perl from OPENSSL_SRC_PERL instead.
+    if [ -z "${OPENSSL_SRC_PERL:-}" ] && perl -e 'exit($^O eq "msys" ? 0 : 1)' 2>/dev/null; then
+      echo "The vendored OpenSSL needs a native Windows Perl (for example Strawberry Perl): set OPENSSL_SRC_PERL to its perl.exe." >&2
+      exit 1
+    fi
+    # In a Visual Studio developer environment rustc trusts PATH, where Git
+    # Bash puts coreutils' link.exe first: name MSVC's linker explicitly.
+    if [ "$host" = x86_64-pc-windows-msvc ] && [ -n "${VCToolsInstallDir:-}" ] &&
+      [ -z "${CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER:-}" ]; then
+      export CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER="${VCToolsInstallDir}bin/Hostx64/x64/link.exe"
+    fi
+    ;;
+esac
 CARGO_TARGET_DIR="$work/target" cargo build --locked \
   --manifest-path "$work/src/Cargo.toml" -p goose --bin goose-acp \
   --profile lean --no-default-features --features "$FEATURES"
-host=$(rustc -vV | sed -n 's/^host: //p')
 mkdir -p "$root/src-tauri/binaries"
-out="$root/src-tauri/binaries/buzz-mesh-goose-$host"
-cp "$work/target/lean/goose-acp" "$out"
-shasum -a 256 "$out"
+out="$root/src-tauri/binaries/buzz-mesh-goose-$host$exe"
+cp "$work/target/lean/goose-acp$exe" "$out"
+if command -v shasum >/dev/null 2>&1; then
+  shasum -a 256 "$out"
+else
+  sha256sum "$out"
+fi
